@@ -6,12 +6,366 @@ from itertools import combinations
 from typing import Optional, Union, Sequence
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.animation import FuncAnimation, PillowWriter
 from plytrons.bcm_sphere import get_axis as _bcm_get_axis
 import plytrons.bcm_sphere as bcm
 from scipy.constants import hbar, eV
 
+
 __all__ = ["make_results_folder"]
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+from pathlib import Path
+import numpy as np
+import plytrons.bcm_sphere as bcm  # for get_axis
+
+def path_with_polarization(out_path, efield, *,
+                           key="E",                # label used in the tag → 'E'
+                           default_basename="figure",
+                           default_ext=".png"):
+    """
+    Append polarization tag from efield.e_hat to a path.
+    - If `out_path` is a filename → 'name_Ey.png'
+    - If `out_path` is a directory or None/"" → '<default_basename>_Ey.png' inside it
+
+    Returns a pathlib.Path.
+    """
+    def _axis_from_vec(v):
+        try:
+            return bcm.get_axis(v)        # expected: 'x', 'y', or 'z'
+        except Exception:
+            v = np.asarray(v, float).ravel()
+            if v.size != 3:
+                raise ValueError("efield.e_hat must be a 3-vector.")
+            return ("x", "y", "z")[int(np.argmax(np.abs(v)))]
+
+    axis = _axis_from_vec(efield.e_hat)
+    tag  = f"_{key}{axis}"
+
+    p = Path("." if not out_path else out_path)
+    if p.suffix:  # looks like a file → insert before extension
+        return p.with_name(p.stem + tag + p.suffix)
+    else:         # looks like a directory → create a filename inside
+        return p / f"{default_basename}{tag}{default_ext}"
+
+
+# ===================== utilidades de geometría =====================
+def set_axes_equal(ax):
+    """Escalas iguales en x, y, z (esferas redondas)."""
+    xlim, ylim, zlim = ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()
+    R = max(np.diff(xlim)[0], np.diff(ylim)[0], np.diff(zlim)[0]) / 2
+    cx, cy, cz = np.mean(xlim), np.mean(ylim), np.mean(zlim)
+    ax.set_xlim(cx - R, cx + R)
+    ax.set_ylim(cy - R, cy + R)
+    ax.set_zlim(cz - R, cz + R)
+
+def sphere_mesh(center, radius, nu=96, nv=48):
+    """Malla (X,Y,Z) y normales (Nx,Ny,Nz) para una esfera."""
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError(f"El radio debe ser positivo y finito; recibido {radius!r}")
+
+    cx, cy, cz = center
+    u = np.linspace(0, 2*np.pi, nu)
+    v = np.linspace(0, np.pi, nv)
+    U, V = np.meshgrid(u, v, indexing="xy")
+    X = cx + radius*np.cos(U)*np.sin(V)
+    Y = cy + radius*np.sin(U)*np.sin(V)
+    Z = cz + radius*np.cos(V)
+    Nx = (X - cx) / radius
+    Ny = (Y - cy) / radius
+    Nz = (Z - cz) / radius
+    return X, Y, Z, Nx, Ny, Nz
+
+def infer_radius_from_centers(C, scale=0.45, fallback=1.0):
+    """
+    Radio base desde la mínima distancia entre centros.
+    Para N=1 o si no hay distancias válidas, usa 'fallback'.
+    """
+    C = np.asarray(C, dtype=float)
+    N = len(C)
+    if N <= 1:
+        return float(fallback)
+
+    dmin = np.inf
+    for i in range(N):
+        di = np.linalg.norm(C[i+1:] - C[i], axis=1)
+        if len(di):
+            dmin = min(dmin, di.min())
+
+    if not np.isfinite(dmin) or dmin <= 0:
+        return float(fallback)
+
+    return scale * dmin
+
+def _unit(v):
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    if n == 0:
+        raise ValueError("Vector nulo no tiene dirección.")
+    return v / n
+
+def _orthogonalize(v, n):
+    """Proyecta v al subespacio perpendicular a n."""
+    n = _unit(n)
+    return v - np.dot(v, n) * n
+
+# ===================== sombreado (Lambert + Phong) =====================
+def shaded_facecolors(Nx, Ny, Nz, base_rgb, light_dir=(1, -1, 2),
+                      ambient=0.35, diffuse=0.65, specular=0.20, shininess=40):
+    """
+    Calcula colores RGBA con iluminación difusa + especular sobre un color base.
+    base_rgb: (3,) en [0,1]; light_dir se normaliza.
+    """
+    L = _unit(np.array(light_dir, dtype=float))
+    NdotL = np.clip(Nx*L[0] + Ny*L[1] + Nz*L[2], 0.0, 1.0)
+
+    # Reflexión R = 2(N·L)N - L
+    Rx = 2*NdotL*Nx - L[0]
+    Ry = 2*NdotL*Ny - L[1]
+    Rz = 2*NdotL*Nz - L[2]
+    Rlen = np.sqrt(Rx*Rx + Ry*Ry + Rz*Rz) + 1e-12
+    Rx, Ry, Rz = Rx/Rlen, Ry/Rlen, Rz/Rlen
+
+    # Dirección de vista (aprox cámara)
+    V = _unit(np.array([0.3, 0.2, 1.0]))
+    RdotV = np.clip(Rx*V[0] + Ry*V[1] + Rz*V[2], 0.0, 1.0)
+    spec = (RdotV ** shininess)
+
+    shade = ambient + diffuse * NdotL + specular * spec
+    shade = np.clip(shade, 0, 1)
+
+    fc = np.empty(Nx.shape + (4,), dtype=float)
+    for c in range(3):
+        fc[..., c] = base_rgb[c] * shade
+    fc[..., 3] = 1.0
+    return fc
+
+# ===================== estilo de ejes 3D (compatible) =====================
+def _style_3d_axes(ax,
+                   pane_face=(0.97, 0.97, 0.99, 1.0),
+                   pane_edge=(0.75, 0.75, 0.85, 1.0),
+                   grid_alpha=0.20):
+    """Estiliza ejes 3D compatible con distintas versiones de Matplotlib."""
+    ax.grid(True, alpha=grid_alpha)
+    # API nueva (>= ~3.6)
+    try:
+        ax.xaxis.set_pane_color(pane_face)
+        ax.yaxis.set_pane_color(pane_face)
+        ax.zaxis.set_pane_color(pane_face)
+        ax.xaxis.line.set_color(pane_edge)
+        ax.yaxis.line.set_color(pane_edge)
+        ax.zaxis.line.set_color(pane_edge)
+        return
+    except Exception:
+        pass
+    # Alternativa con .pane
+    try:
+        for a in (ax.xaxis, ax.yaxis, ax.zaxis):
+            a.pane.set_facecolor(pane_face)
+            a.pane.set_edgecolor(pane_edge)
+        return
+    except Exception:
+        pass
+    # Fallback API antigua (Axes3D legacy)
+    try:
+        for pane in (ax.w_xaxis, ax.w_yaxis, ax.w_zaxis):
+            pane.set_pane_color(pane_face)
+            pane.line.set_color(pane_edge)
+    except Exception:
+        pass
+
+# ===================== flechas EM (con leyenda) =====================
+def draw_em_arrows(ax, origin, k_vec, E_vec, lengths,
+                   colors=("C3","C0","C2"),
+                   labels=(r"$\mathbf{k}$", r"$\mathbf{E}$", r"$\mathbf{H}$"),
+                   show_labels_on_plot=True):
+    """
+    Dibuja flechas k, E, (opcional) H y devuelve 'handles' de leyenda con sus colores.
+    """
+    k_hat = _unit(k_vec)
+    E_hat = _unit(_orthogonalize(E_vec, k_hat))
+    H_hat = np.cross(k_hat, E_hat)
+    k_len, E_len, H_len = lengths
+
+    # Flecha k
+    ax.quiver(*origin, *(k_hat*k_len), arrow_length_ratio=0.12, linewidth=2.2, color=colors[0])
+    if show_labels_on_plot:
+        ax.text(*(origin + k_hat*(k_len*1.20)), labels[0], color=colors[0])
+
+    # Flecha E
+    ax.quiver(*origin, *(E_hat*E_len), arrow_length_ratio=0.12, linewidth=2.2, color=colors[1])
+    if show_labels_on_plot:
+        ax.text(*(origin + E_hat*(E_len*1.20)), labels[1], color=colors[1])
+
+    # Flecha H (si hay longitud)
+    if H_len and H_len > 0:
+        ax.quiver(*origin, *(H_hat*H_len), arrow_length_ratio=0.12, linewidth=2.2, color=colors[2])
+        if show_labels_on_plot:
+            ax.text(*(origin + H_hat*(H_len*1.20)), labels[2], color=colors[2])
+
+    # Proxies para leyenda
+    handles = []
+    if k_len and k_len > 0:
+        handles.append(Line2D([0],[0], color=colors[0], lw=3, label=labels[0]))
+    if E_len and E_len > 0:
+        handles.append(Line2D([0],[0], color=colors[1], lw=3, label=labels[1]))
+    if H_len and H_len > 0:
+        handles.append(Line2D([0],[0], color=colors[2], lw=3, label=labels[2]))
+    return handles
+
+# ===================== función principal =====================
+def plot_spheres(centers, radii=None, *,
+                 cmap_name="viridis",
+                 light_dir=(1, -1, 2),
+                 elev=24, azim=42,
+                 title=None,
+                 # ----- EM -----
+                 k_vec=None, E_vec=None, draw_H=True,
+                 origin_mode="centroid", corner=("max","max","max"),
+                 corner_inset=0.12, offset_along_k=-0.15,
+                 # ----- NUEVO: guardado -----
+                 outdir: Optional[Union[str, Path]] = None,
+                 fname: str = "geometry.png",
+                 save_dpi: int = 300,
+                 save_transparent: bool = False,
+                 show: bool = True):
+    """
+    Si 'outdir' no es None, guarda la figura como outdir / fname (PNG por defecto).
+    Devuelve (fig, ax).
+    """
+    """
+    origin_mode:
+        - "centroid": ancla en el centroide (comportamiento anterior).
+        - "corner"  : ancla en una esquina del bounding box (controlada por 'corner').
+        - (x,y,z)   : vector con el punto exacto.
+    corner:
+        Tupla con 'min'/'max' para (x,y,z). Ej: ('min','max','max').
+    corner_inset:
+        Cuánto desplazar desde la esquina hacia adentro (0–0.5 aprox), como fracción del tamaño de la escena.
+    """
+    C = np.asarray(centers, dtype=float)
+    assert C.ndim == 2 and C.shape[1] == 3, "centers debe ser (N,3)."
+    N = len(C)
+
+    # --- radios (igual que antes) ---
+    if radii is None:
+        r = infer_radius_from_centers(C, scale=0.45, fallback=1.0)
+        radii = np.full(N, r, dtype=float)
+    elif np.isscalar(radii):
+        radii = np.full(N, float(radii), dtype=float)
+    else:
+        radii = np.asarray(radii, dtype=float)
+        assert len(radii) == N, "radii debe ser escalar o de largo N."
+
+    # --- figura y estilo (igual que antes) ---
+    fig = plt.figure(figsize=(8.8, 8.6), dpi=140)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_box_aspect((1, 1, 1))
+    _style_3d_axes(ax, pane_face=(0.97, 0.97, 0.99, 1.0),
+                      pane_edge=(0.75, 0.75, 0.85, 1.0),
+                      grid_alpha=0.20)
+
+    cmap = plt.get_cmap(cmap_name)
+    raw = cmap(np.linspace(0.08, 0.92, N))[:, :3]
+    base_colors = 0.25 + 0.75 * raw
+
+    for i, (c, r) in enumerate(zip(C, radii)):
+        X, Y, Z, Nx, Ny, Nz = sphere_mesh(c, r)
+        facecolors = shaded_facecolors(Nx, Ny, Nz, base_colors[i], light_dir=light_dir)
+        ax.plot_surface(X, Y, Z, rstride=1, cstride=1,
+                        facecolors=facecolors, linewidth=0.1,
+                        antialiased=True, shade=False)
+        ax.scatter(*c, s=18, c="k", depthshade=False)
+
+    # --- encuadre robusto (igual que te dejé) ---
+    ptp_xyz = np.ptp(C, axis=0, keepdims=True).max()
+    r_max = float(np.max(radii))
+    scene_span = max(ptp_xyz, 3.0 * r_max, 1e-9)
+    pad = 0.30 * scene_span
+
+    cxyz = C.mean(axis=0)
+    half = 0.5 * scene_span + pad
+    mins = cxyz - half
+    maxs = cxyz + half
+    ax.set_xlim(mins[0], maxs[0])
+    ax.set_ylim(mins[1], maxs[1])
+    ax.set_zlim(mins[2], maxs[2])
+
+    set_axes_equal(ax)
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    if title: ax.set_title(title, pad=10)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor((0.98, 0.98, 1.0))
+
+    # --- flechas EM + leyenda ---
+    legend_handles = []
+    if k_vec is not None and E_vec is not None:
+        # origen segun modo
+        if isinstance(origin_mode, str):
+            mode = origin_mode.lower()
+            if mode == "centroid":
+                o = cxyz.copy()
+            elif mode == "corner":
+                # corner=("min"/"max", "min"/"max", "min"/"max")
+                selects = []
+                for i, mm in enumerate(corner):
+                    if str(mm).lower().startswith("min"):
+                        selects.append(mins[i])
+                    elif str(mm).lower().startswith("max"):
+                        selects.append(maxs[i])
+                    else:
+                        raise ValueError("corner debe contener 'min' o 'max' por eje.")
+                o = np.array(selects, dtype=float)
+                # mete el origen hacia adentro del volumen un poco
+                inset = float(corner_inset) * scene_span
+                # el vector hacia el centro, normalizado por eje
+                to_center = cxyz - o
+                # evita mover en 0 si coincide exacto con el centroide
+                if np.allclose(to_center, 0):
+                    to_center = np.array([1.0, 1.0, 1.0])
+                to_center = to_center / (np.linalg.norm(to_center) + 1e-12)
+                o = o + inset * to_center
+            else:
+                raise ValueError("origin_mode debe ser 'centroid', 'corner' o un vector (3,).")
+        else:
+            o = np.asarray(origin_mode, dtype=float)  # es un vector (x,y,z)
+            if o.shape != (3,):
+                raise ValueError("origin_mode vector debe tener forma (3,)")
+
+        # mismo offset a lo largo de k
+        k_hat = _unit(k_vec)
+        o = o + offset_along_k * k_hat
+
+        lengths = (0.36*scene_span, 0.28*scene_span, 0.25*scene_span if draw_H else 0.0)
+        legend_handles = draw_em_arrows(
+            ax, o, k_vec, E_vec, lengths,
+            colors=("C3","C0","C2"),
+            labels=(r"$\mathbf{k}$", r"$\mathbf{E}$", r"$\mathbf{H}$"),
+            show_labels_on_plot=True
+        )
+
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="upper left",
+                  frameon=True, framealpha=0.9)
+
+    # ======== GUARDAR FIGURA (nuevo) ========
+    if outdir is not None:
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        (outdir / fname).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(outdir / fname, dpi=save_dpi, bbox_inches="tight",
+                    transparent=save_transparent)
+
+    if show:
+        plt.tight_layout()
+        plt.show()
+
+    return fig, ax 
 
 def make_results_folder(
     bcms: Sequence,                 # sequence of BCMObject (must have .diameter, .position)
@@ -217,13 +571,50 @@ def convert_raw_hot(Te, Th, E, dE_factor):
 
     Te_plot = np.sum(TTe * Phi(EEp - EE), axis=1)
     Th_plot = np.sum(TTh * Phi(EEp - EE), axis=1)
+
     return E_plot, Te_plot, Th_plot
 
-def hot_carriers_plot(Te, Th, Te_raw, Th_raw, 
-                      e_states, Np, peak, tau_e, D, hv, EF, dE_factor, delta):
+# def convert_raw_hot(Te, Th, E, dE_factor):
+#     idx = np.argsort(E)
+#     E = E[idx]; Te = Te[idx]; Th = Th[idx]
+#     E_plot = np.linspace(E.min(), E.max(), 1000)
+#     dE = (E_plot[1] - E_plot[0]) * dE_factor
+#     Phi = lambda x: (1/np.pi) * (dE/2) / (x**2 + (dE/2)**2)  # Lorentzian (unit area)
 
-    Te = Te/1000
-    Th = Th/1000
+#     EE, EEp = np.meshgrid(E, E_plot)
+#     TTe = np.meshgrid(Te, E_plot)[0]
+#     TTh = np.meshgrid(Th, E_plot)[0]
+
+#     # --- bin widths (trapezoidal) ---
+#     w = np.empty_like(E)
+#     if E.size > 1:
+#         w[1:-1] = 0.5 * (E[2:] - E[:-2])
+#         w[0]    = E[1] - E[0]
+#         w[-1]   = E[-1] - E[-2]
+#     else:
+#         w[:] = 0.0
+
+#     # weighted sum ≡ trapz along E
+#     Te_plot = np.sum((TTe * w[None, :]) * Phi(EEp - EE), axis=1)
+#     Th_plot = np.sum((TTh * w[None, :]) * Phi(EEp - EE), axis=1)
+#     return E_plot, Te_plot, Th_plot
+
+
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+
+def hot_carriers_plot(Te, Th, Te_raw, Th_raw, 
+                      e_states, Np, peak, tau_e, D, hv, EF, dE_factor, delta, efield,
+                      out_path):
+    """
+    Displays and saves the hot-carriers plot.
+    - If `out_path` is None or empty, a default filename is created.
+    - Returns nothing (shows the plot and saves it).
+    """
+    # Units/arrays
+    Te = Te/1000.0
+    Th = Th/1000.0
     Te_raw = Te_raw
     Th_raw = Th_raw
 
@@ -237,7 +628,8 @@ def hot_carriers_plot(Te, Th, Te_raw, Th_raw,
     # fs^-1 → ps^-1, then per eV
     to_ps = 1000.0
     scale = to_ps / hv
-    Te_x *= scale; Th_x *= scale
+    Te_x *= scale
+    Th_x *= scale
 
     # masks
     mask_e = (x >= EF) & (x <= EF + delta)
@@ -245,13 +637,13 @@ def hot_carriers_plot(Te, Th, Te_raw, Th_raw,
 
     # plot
     fig, ax = plt.subplots(figsize=(20, 4.5))
-    ax.fill_between((x - EF)[mask_e], Te_x[mask_e], color='r', alpha=0.38)
-    ax.fill_between((x - EF)[mask_h], Th_x[mask_h], color='b', alpha=0.38)
+    ax.fill_between((x - EF)[mask_e], Te_x[mask_e], color='r', alpha=0.38, label='Electrons (dens.)')
+    ax.fill_between((x - EF)[mask_h], Th_x[mask_h], color='b', alpha=0.38, label='Holes (dens.)')
 
     # SECOND Y-AXIS for bars
     ax2 = ax.twinx()
     bar_width = 2.0e-2
-    ax2.bar(E_all - EF, Te_raw * to_ps, width=bar_width, color='firebrick', alpha=0.9, label='Electrons ')
+    ax2.bar(E_all - EF, Te_raw * to_ps, width=bar_width, color='firebrick', alpha=0.9, label='Electrons')
     ax2.bar(E_all - EF, Th_raw * to_ps, width=bar_width, color='royalblue', alpha=0.9, label='Holes')
 
     # guides
@@ -262,21 +654,37 @@ def hot_carriers_plot(Te, Th, Te_raw, Th_raw,
     ax.set_xlim(-delta, delta)
     ax.set_xlabel('Hot carrier energy relative to Fermi level (eV)')
     ax.set_ylabel(r'Hot carrier generation rate density $[{10}^{-3}\mathrm{eV}^{-1}\,\mathrm{ps}^{-1}\,\mathrm{nm}^{-3}]$')
-    ax2.set_ylabel('hot carrier generation rate per particle $[\mathrm{ps}^{-1}]$')  # ← label for the bars’ axis
+    ax2.set_ylabel('Hot carrier generation rate per particle $[\mathrm{ps}^{-1}]$')
 
-    # optional: fix independent y-limits
+    # y-limits
     ax.set_ylim(0, 1.05 * max(Te_x[mask_e].max(initial=0), Th_x[mask_h].max(initial=0)))
     ax2.set_ylim(0, 3.0 * to_ps * max(Te_raw.max(initial=0), Th_raw.max(initial=0)))
 
-    # one combined legend
+    # combined legend
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, loc='upper right')
 
-    ax.set_title(rf'Nanoparticle N°{Np}, Resonance peak N°{peak}, D = {D} nm, $\tau = ${np.atleast_1d(tau_e)[0]/1000:.2f} ps, $h\nu$ = {hv:.2f} eV')
+    tau_fs = float(np.atleast_1d(tau_e)[0])
+    ax.set_title(rf'Nanoparticle N°{Np}, Resonance peak N°{peak}, D = {D} nm, '
+                 rf'$\tau = ${tau_fs/1000:.2f} ps, $h\nu$ = {hv:.2f} eV')
     ax.grid(True, ls=':')
-    plt.tight_layout()
+    plt.tight_layout() 
+
+    # -------- Save to out_path (create folders if needed) --------
+    if out_path is None or str(out_path).strip() == "":
+        out_path = path_with_polarization(f'hot_carriers_N{Np}_peak{peak}_D{D}nm_tau{int(tau_fs)}fs_hv{hv:.2f}eV.png', efield)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+
+    # Show and close (no return)
     plt.show()
+    plt.close(fig)
+
+
+
 
 def hot_carrier_dynamics_plot(Te, Th, Te_raw, Th_raw, 
                               e_states, Np, peak, tau_e, D, hv, EF, dE_factor, delta, fps, out_path, bar_width=2.0e-2):
@@ -406,3 +814,231 @@ def hot_carrier_dynamics_plot(Te, Th, Te_raw, Th_raw,
         display(Image(filename=out_path))
     except Exception:
         pass
+
+def _edges_from_centers(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, float)
+    mid = 0.5*(x[1:] + x[:-1])
+    first = x[0] - (mid[0] - x[0])
+    last  = x[-1] + (x[-1] - mid[-1])
+    return np.concatenate(([first], mid, [last]))
+
+def _collapse_equal_energies(M_ord: np.ndarray, E_ord: np.ndarray, how: str = "sum", tol: float = 0.0):
+    N = E_ord.size
+    jump = (np.diff(E_ord) > tol) if tol > 0.0 else (np.diff(E_ord) != 0.0)
+    starts = np.concatenate(([0], np.where(jump)[0] + 1))
+    counts = np.diff(np.concatenate((starts, [N])))
+    E_unique = E_ord[starts]
+    R = np.add.reduceat(M_ord, starts, axis=0)       # (Nu, N)
+    M_coll = np.add.reduceat(R, starts, axis=1)      # (Nu, Nu)
+    if how == "mean":
+        c = counts.astype(float)
+        M_coll = M_coll / (c[:, None] * c[None, :])
+    elif how != "sum":
+        raise ValueError("how must be 'sum' or 'mean'.")
+    return M_coll, E_unique, counts
+
+def plot_transition_matrix_colormap(
+    Mfi2: np.ndarray,
+    E_all: np.ndarray,
+    *,
+    relative_to_EF: bool = False,
+    E_F: float = 0.0,
+    dedup: str = "sum",       # 'sum', 'mean', or 'none'
+    tol: float = 0.0,         # energy equality tolerance (eV) for dedup
+    # ---- NEW SCALING CONTROLS ----
+    scale: str = "asinh",     # 'asinh' (default), 'pow', 'linear', 'log'
+    gamma: float = 0.5,       # used when scale='pow' (0.4–0.7 is a nice range)
+    tiny: float = 1e-30,      # used when scale='log'
+    qmin: float = 0.001,      # percentile clip (0..1)
+    qmax: float = 0.999,
+    soft: float | None = None,# used when scale='asinh'; if None, auto
+    xlabel: str = "Final-state energy (eV)",
+    ylabel: str = "Initial-state energy (eV)",
+    title: str | None = None,
+    savepath: str | None = None,
+) -> None:
+    """Energy-sorted heatmap with gentle contrast options."""
+    M = np.asarray(Mfi2, float)
+    E = np.asarray(E_all, float)
+    if M.ndim != 2 or M.shape[0] != M.shape[1]:
+        raise ValueError("Mfi2 must be a square (N,N).")
+    if E.ndim != 1 or E.size != M.shape[0]:
+        raise ValueError("E_all must be (N,) matching Mfi2.")
+
+    # Sort by energy
+    E_plot = E - E_F if relative_to_EF else E.copy()
+    order  = np.argsort(E_plot)
+    M_ord  = M[order][:, order]
+    E_ord  = E_plot[order]
+
+    # Collapse degeneracies for pcolormesh
+    if dedup != "none":
+        M_plot, E_plot_u, _ = _collapse_equal_energies(M_ord, E_ord, how=dedup, tol=tol)
+    else:
+        if np.any(np.diff(E_ord) == 0.0):
+            # fallback to imshow if exact duplicates and no dedup requested
+            Zraw = M_ord
+            vmin = np.quantile(Zraw, qmin)
+            vmax = np.quantile(Zraw, qmax)
+            Zraw = np.clip(Zraw, vmin, vmax)
+            if scale == "log":
+                Z = np.log10(Zraw + tiny)
+                cbl = r"log$_{10}(M_{fi}^2)$"
+            elif scale == "pow":
+                Z = np.power(Zraw / vmax, gamma)
+                cbl = rf"$(M_{{fi}}^2)^\gamma$ (γ={gamma:.2f})"
+            elif scale == "asinh":
+                s = soft
+                pos = Zraw[Zraw > 0]
+                if s is None:
+                    s = (np.percentile(pos, 95)/3.0) if pos.size else 1.0
+                Z = np.arcsinh(Zraw / s)
+                cbl = r"asinh($M_{fi}^2 / s$)"
+            else:
+                Z = Zraw
+                cbl = r"$M_{fi}^2$"
+            fig, ax = plt.subplots(figsize=(6,5), constrained_layout=True)
+            im = ax.imshow(Z, origin="lower", aspect="equal",
+                           extent=[E_ord[0], E_ord[-1], E_ord[0], E_ord[-1]])
+            cb = fig.colorbar(im, ax=ax); cb.set_label(cbl)
+            ax.set_xlabel(xlabel if not relative_to_EF else xlabel.replace("(eV)", "− E$_F$ (eV)"))
+            ax.set_ylabel(ylabel if not relative_to_EF else ylabel.replace("(eV)", "− E$_F$ (eV)"))
+            if title: ax.set_title(title)
+            if savepath: fig.savefig(savepath, dpi=300, bbox_inches="tight")
+            plt.show()
+            return
+        else:
+            M_plot, E_plot_u = M_ord, E_ord
+
+    # Robust clipping to avoid extreme outliers
+    vmin = np.quantile(M_plot, qmin)
+    vmax = np.quantile(M_plot, qmax)
+    A = np.clip(M_plot, vmin, vmax)
+
+    # Gentle contrast transforms
+    if scale == "log":
+        Z = np.log10(A + tiny); cbl = r"log$_{10}(M_{fi}^2)$"
+    elif scale == "pow":
+        Z = np.power(A / vmax, gamma); cbl = rf"$(M_{{fi}}^2)^\gamma$ (γ={gamma:.2f})"
+    elif scale == "asinh":
+        pos = A[A > 0]
+        s = soft if soft is not None else ((np.percentile(pos, 95)/3.0) if pos.size else 1.0)
+        Z = np.arcsinh(A / s); cbl = r"asinh($M_{fi}^2 / s$)"
+    else:
+        Z = A; cbl = r"$M_{fi}^2$"
+
+    edges = _edges_from_centers(E_plot_u)
+    fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
+    mesh = ax.pcolormesh(edges, edges, Z, shading="auto")
+    cb = fig.colorbar(mesh, ax=ax); cb.set_label(cbl)
+    ax.set_xlabel(xlabel if not relative_to_EF else xlabel.replace("(eV)", "− E$_F$ (eV)"))
+    ax.set_ylabel(ylabel if not relative_to_EF else ylabel.replace("(eV)", "− E$_F$ (eV)"))
+    if title: ax.set_title(title)
+    ax.set_xlim(edges[0], edges[-1]); ax.set_ylim(edges[0], edges[-1])
+    ax.set_aspect("equal", adjustable="box")
+    if savepath: fig.savefig(savepath, dpi=300, bbox_inches="tight")
+    plt.show()
+
+def plot_Ne_cdf_steps(
+    eps_axis: np.ndarray,
+    Ne_clean: np.ndarray,     # shape (Ntau, Nε)
+    tau_e: np.ndarray,        # fs, length Ntau
+    *,
+    hv: float | None = None,                 # eV
+    E_lines: list[float] | None = None,      # absolute energies (eV) for vertical refs
+    E_line_factors: tuple[float, float] | None = (0.2, 0.5),
+    figsize: tuple[float, float] = (5.6, 3.6),
+    dpi: int = 140,
+    cmap_name: str = "viridis",
+    xlabel: str = r"$\varepsilon = E_f - E_F$ (eV)",
+    ylabel: str = r"$N_e$ per absorbed photon",
+    # --- new bits ---
+    Np: int | None = None,
+    peak: int | None = None,
+    D: float | None = None,
+    efield=None,                               # pass your EField here
+    out_dir: str | Path | None = None,         # optional directory override
+    save_dpi: int = 300,
+    save_transparent: bool = False,
+    ax: plt.Axes | None = None,
+    close: bool = False,
+) -> None:
+    """
+    Plots Ne(ε) steps colored by τ, saves to a name that includes
+    hot_carriers_N{Np}_peak{peak}_D{D}nm_tau{int(tau_fs)}fs_hv{hv:.2f}eV
+    and appends the polarization tag from `efield` (e.g., _Ey).
+    """
+    eps_axis = np.asarray(eps_axis, float)
+    Ne_clean = np.asarray(Ne_clean, float)
+    tau_e = np.asarray(tau_e, float)
+
+    if Ne_clean.ndim != 2:
+        raise ValueError("Ne_clean must be 2D with shape (Ntau, Nε).")
+    if Ne_clean.shape[1] != eps_axis.size:
+        raise ValueError("Ne_clean.shape[1] must equal eps_axis.size.")
+    if Ne_clean.shape[0] != tau_e.size:
+        raise ValueError("len(tau_e) must equal Ne_clean.shape[0].")
+
+    created_fig = False
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+        created_fig = True
+    else:
+        fig = ax.figure
+
+    # Colormap by tau
+    cmap = plt.get_cmap(cmap_name)
+    tmin = float(np.min(tau_e)); tmax = float(np.max(tau_e))
+    if np.isclose(tmin, tmax): tmin, tmax = tmin - 1e-12, tmax + 1e-12
+    norm = plt.Normalize(vmin=tmin, vmax=tmax)
+
+    for i, tau in enumerate(tau_e):
+        ax.step(eps_axis, Ne_clean[i], where="post",
+                lw=1.0, alpha=0.8, color=cmap(norm(float(tau))))
+
+    # Vertical reference lines
+    lines = list(E_lines) if E_lines is not None else (
+        [float(f)*float(hv) for f in E_line_factors] if (hv is not None and E_line_factors is not None) else None
+    )
+    ymax = float(Ne_clean.max()) * 1.05
+    if lines:
+        for Eref in lines:
+            ax.axvline(Eref, ls="--", lw=1.2, color="k", alpha=0.7, zorder=3)
+            ax.text(Eref, 0.98*ymax, f"{Eref:.1f} eV",
+                    ha="right", va="top", rotation=90, fontsize=9, color="k", alpha=0.8)
+
+    # Colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, pad=0.01); cbar.set_label("τ (fs)")
+
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    ax.set_xlim(0.0, float(eps_axis.max())); ax.set_ylim(0.0, ymax)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    # ---- Build the requested out_path and append polarization ----
+    if any(v is None for v in (Np, peak, D, hv)):
+        base_name = "hot_carriers"
+    else:
+        base_name = f"HC_efficiency_N{Np+1}_peak{peak}_D{D}nm_hv{hv:.2f}eV.png"
+
+    # append polarization (e_hat) to the filename
+    save_name = path_with_polarization(base_name, efield) if efield is not None else Path(base_name)
+
+    # choose directory
+    out_dir = Path("." if out_dir is None else out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_path = (out_dir / save_name.name) if out_dir.is_dir() else out_dir
+
+    fig.savefig(save_path, dpi=save_dpi, bbox_inches="tight", transparent=save_transparent)
+
+    if created_fig:
+        plt.show()
+        if close:
+            plt.close(fig)
+
+
+
+
+
+

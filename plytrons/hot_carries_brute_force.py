@@ -126,7 +126,7 @@ def _transition_M(
 # 3. Parallel driver with full (l,m) summation
 # =============================================================================
 
-@nb.njit(fastmath=True, parallel=True)
+@nb.njit(fastmath=False, parallel=True)
 def _hot_e_dist_parallel(
     a_nm: float,
     hv_eV: float,
@@ -211,7 +211,7 @@ def _hot_e_dist_parallel(
     Te = S * Te_raw/Vol
     Th = S * Th_raw/Vol
 
-    return Te, Th
+    return Te, Th, Te_raw, Th_raw
 
 # =============================================================================
 # 4. Thin wrapper

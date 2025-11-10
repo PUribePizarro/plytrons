@@ -185,108 +185,108 @@ def _M_transition_squared(
     # include |Af*Ai|^2
     return Mfi_2 * AA_abs2
 
-@nb.njit(fastmath=False, parallel = False)
-def _M_transition_squared(
-    lf: int,
-    li: int,
-    a_nm: float,
-    X_lm: np.ndarray,     # complex128[:]
-    state_f: QWLevelSet,
-    state_i: QWLevelSet,
-) -> np.ndarray:
-    """Compute *Mᶠᵢ* for a given pair of quantum numbers (l_f, m_f) ← (l_i, m_i)."""
+# @nb.njit(fastmath=False, parallel = False)
+# def _M_transition_squared(
+#     lf: int,
+#     li: int,
+#     a_nm: float,
+#     X_lm: np.ndarray,     # complex128[:]
+#     state_f: QWLevelSet,
+#     state_i: QWLevelSet,
+# ) -> np.ndarray:
+#     """Compute *Mᶠᵢ* for a given pair of quantum numbers (l_f, m_f) ← (l_i, m_i)."""
     
-    # get parameters of final state
-    Ef, Af = state_f.Eb.real.astype(np.float64), state_f.A
-    n_f = Ef.size
+#     # get parameters of final state
+#     Ef, Af = state_f.Eb.real.astype(np.float64), state_f.A
+#     n_f = Ef.size
 
-    # get parameters of initial state
-    Ei, Ai = state_i.Eb.real.astype(np.float64), state_i.A
-    n_i = Ei.size
+#     # get parameters of initial state
+#     Ei, Ai = state_i.Eb.real.astype(np.float64), state_i.A
+#     n_i = Ei.size
 
-    # |Af*Ai|^2 as an outer product -> (n_f, n_i)
-    AAi, AAf = nb_meshgrid(Ai, Af)          # shapes (n_i, n_f) & (n_f, n_i)
+#     # |Af*Ai|^2 as an outer product -> (n_f, n_i)
+#     AAi, AAf = nb_meshgrid(Ai, Af)          # shapes (n_i, n_f) & (n_f, n_i)
 
-    AA_abs2 = np.abs(AAf.conj() * AAi)**2    # (n_f, n_i), real
+#     AA_abs2 = np.abs(AAf.conj() * AAi)**2    # (n_f, n_i), real
 
-    # ----- radial grid & Bessels -------------------------------------------
-    Nr = 128
-    r = np.linspace(0.001, a_nm, Nr)      # (Nr,)
-    rr = r[:, None]                          # (Nr, 1) for broadcasting
+#     # ----- radial grid & Bessels -------------------------------------------
+#     Nr = 128
+#     r = np.linspace(0.001, a_nm, Nr)      # (Nr,)
+#     rr = r[:, None]                          # (Nr, 1) for broadcasting
 
-    # Bessel columns: A=(Nr,n_f), B=(Nr,n_i)
-    j_lf = js_real(lf, ke(Ef[None, :]) * rr)       # j_lf(k_f r)
-    j_li = js_real(li, ke(Ei[None, :]) * rr)       # j_li(k_i r)
+#     # Bessel columns: A=(Nr,n_f), B=(Nr,n_i)
+#     j_lf = js_real(lf, ke(Ef[None, :]) * rr)       # j_lf(k_f r)
+#     j_li = js_real(li, ke(Ei[None, :]) * rr)       # j_li(k_i r)
 
-    # trapezoid weights along r (Numba-safe)
-    dr = 0.0 if Nr < 2 else (r[1] - r[0])
-    w  = np.full(Nr, dr, dtype=np.float64)
-    if Nr >= 1:
-        w[0] *= 0.5
-        w[-1] *= 0.5
+#     # trapezoid weights along r (Numba-safe)
+#     dr = 0.0 if Nr < 2 else (r[1] - r[0])
+#     w  = np.full(Nr, dr, dtype=np.float64)
+#     if Nr >= 1:
+#         w[0] *= 0.5
+#         w[-1] *= 0.5
 
-    # will accumulate the real, positive squared amplitudes
-    Mfi_2 = np.zeros((n_f, n_i), dtype=np.float64)
+#     # will accumulate the real, positive squared amplitudes
+#     Mfi_2 = np.zeros((n_f, n_i), dtype=np.float64)
 
-    # max l present in X_lm
-    le_max = idx_to_lm(X_lm.size - 1)[0]
+#     # max l present in X_lm
+#     le_max = idx_to_lm(X_lm.size - 1)[0]
 
-    for le in range(1, int(le_max) + 1):
+#     for le in range(1, int(le_max) + 1):
 
-        # triangle rule: |lf - li| <= le <= lf + li
-        if le < abs(li - lf) or le > li + lf:
-            continue
+#         # triangle rule: |lf - li| <= le <= lf + li
+#         if le < abs(li - lf) or le > li + lf:
+#             continue
 
-        # even-sum rule: lf + le + li must be even
-        if ((lf + le + li) & 1) == 1:
-            continue
+#         # even-sum rule: lf + le + li must be even
+#         if ((lf + le + li) & 1) == 1:
+#             continue
 
-       # ---------- Integration along solid angle ---------------------
-        # power in field multipole le: P_le = sum_m |X_{le m}|^2
-        idx0 = lm_to_idx(le, -le)
-        idx1 = lm_to_idx(le,  le) + 1
-        Xl = X_lm[idx0:idx1]
+#        # ---------- Integration along solid angle ---------------------
+#         # power in field multipole le: P_le = sum_m |X_{le m}|^2
+#         idx0 = lm_to_idx(le, -le)
+#         idx1 = lm_to_idx(le,  le) + 1
+#         Xl = X_lm[idx0:idx1]
 
-        # Numba-friendly real power sum
-        X_lm_sum = 0.0
-        for x_lm in Xl:
-            X_lm_sum += x_lm.real * x_lm.real + x_lm.imag * x_lm.imag
+#         # Numba-friendly real power sum
+#         X_lm_sum = 0.0
+#         for x_lm in Xl:
+#             X_lm_sum += x_lm.real * x_lm.real + x_lm.imag * x_lm.imag
 
-        if X_lm_sum <= 1e-5:
-            continue
+#         if X_lm_sum <= 1e-5:
+#             continue
 
-        # angular factor from m_i, m_f sums (orthogonality of 3j’s)
-        W = Wigner3j(lf, le, li, 0, 0, 0)     # order is harmless once squared
-        Mfi_ang2 = ((2.0*lf + 1.0) * (2.0*li + 1.0) / (4.0*np.pi*(2*le + 1))) * (W * W) * X_lm_sum
+#         # angular factor from m_i, m_f sums (orthogonality of 3j’s)
+#         W = Wigner3j(lf, le, li, 0, 0, 0)     # order is harmless once squared
+#         Mfi_ang2 = ((2.0*lf + 1.0) * (2.0*li + 1.0) / (4.0*np.pi*(2*le + 1))) * (W * W) * X_lm_sum
 
 
                     
-        # amplitude prefactor, squared (same physics as in _transition_M)
-        # note: this is distinct from the orthogonality 1/(2le+1) that cancelled
-        pref = (1.0/eps0) * np.sqrt(le / (a_nm**3))/np.sqrt(2*le + 1)
-        scale2 = (pref / (a_nm**(le - 1)))**2  # real
+#         # amplitude prefactor, squared (same physics as in _transition_M)
+#         # note: this is distinct from the orthogonality 1/(2le+1) that cancelled
+#         pref = (1.0/eps0) * np.sqrt(le / (a_nm**3))/np.sqrt(2*le + 1)
+#         scale2 = (pref / (a_nm**(le - 1)))**2  # real
 
-        # radial integrals for each Ef row
-        # build weights r^(le+2)*w once per le
-        rw = np.empty(Nr, dtype=np.float64)
-        for ii in range(Nr):
-            rw[ii] = w[ii] * (r[ii] ** (le + 2))
+#         # radial integrals for each Ef row
+#         # build weights r^(le+2)*w once per le
+#         rw = np.empty(Nr, dtype=np.float64)
+#         for ii in range(Nr):
+#             rw[ii] = w[ii] * (r[ii] ** (le + 2))
 
-        # compute weighted B, then a single GEMM for all (f,i):
-        # I = ∫ j_lf(k_f r) j_li(k_i r) r^(le+2) dr → (n_f, n_i)
-        j_li_w = (rw[:, None]) * j_li                  # (Nr, n_i)
+#         # compute weighted B, then a single GEMM for all (f,i):
+#         # I = ∫ j_lf(k_f r) j_li(k_i r) r^(le+2) dr → (n_f, n_i)
+#         j_li_w = (rw[:, None]) * j_li                  # (Nr, n_i)
 
-        j_lf_T  = np.ascontiguousarray(j_lf.T)   # (n_f, Nr)
-        j_li_wc = np.ascontiguousarray(j_li_w)   # (Nr, n_i)
-        I = j_lf_T @ j_li_wc                        # (n_f, n_i)
+#         j_lf_T  = np.ascontiguousarray(j_lf.T)   # (n_f, Nr)
+#         j_li_wc = np.ascontiguousarray(j_li_w)   # (Nr, n_i)
+#         I = j_lf_T @ j_li_wc                        # (n_f, n_i)
 
-        # accumulate squared integral
-        Mfi_2 += scale2 * Mfi_ang2 * (I * I)        # all real
+#         # accumulate squared integral
+#         Mfi_2 += scale2 * Mfi_ang2 * (I * I)        # all real
 
-        # print(AA_abs2, Mfi_ang2, (I * I))
+#         # print(AA_abs2, Mfi_ang2, (I * I))
 
-    # include |Af*Ai|^2
-    return Mfi_2 * AA_abs2
+#     # include |Af*Ai|^2
+#     return Mfi_2 * AA_abs2
 
 # =============================================================================
 # 3. Parallel driver with full (l,m) summation
@@ -301,7 +301,7 @@ def _hot_e_dist_parallel(
     e_state: List[QWLevelSet],
     X_lm: np.ndarray,
     Pabs: float
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
     # --- flatten bound levels ---------------------------------------------
     lmax = len(e_state)
@@ -355,11 +355,13 @@ def _hot_e_dist_parallel(
         denom_h = (hv_eV - EE_i + EE_f)**2 + gamma_e**2
 
         TTe = 4.0/tau_dx * fd_i * (1.0 - fd_f) * (
-            Mfi_2_all/denom_e + Mfi_2_all.T/denom_h
+            Mfi_2_all/denom_e
+            #   + Mfi_2_all.T/denom_h
             )
         
         TTh = 4.0/tau_dx * fd_f * (1.0 - fd_i) * (
-            Mfi_2_all/denom_h + Mfi_2_all.T/denom_e
+            Mfi_2_all/denom_h
+            #   + Mfi_2_all.T/denom_e
             )
 
         Te_raw = TTe.sum(axis=1)
@@ -377,7 +379,19 @@ def _hot_e_dist_parallel(
         Te_raw_[i] = Te_raw
         Th_raw_[i] = Th_raw
 
-    return Te, Th, Te_raw_, Th_raw_
+    # ---- sort by energy (lowest → highest) and build a SORTED matrix ------
+    order = np.argsort(E_all)
+    E_sorted = E_all[order]
+
+    # Numba-safe 2D reindex (explicit loops avoid fancy-index pitfalls)
+    Mfi_2_sorted = np.empty_like(Mfi_2_all)
+    for ii in range(N):
+        i_old = order[ii]
+        for jj in range(N):
+            j_old = order[jj]
+            Mfi_2_sorted[ii, jj] = Mfi_2_all[i_old, j_old]
+
+    return Te, Th, Te_raw_, Th_raw_, Mfi_2_sorted, E_sorted
 
 
 # =============================================================================
@@ -392,7 +406,7 @@ def hot_e_dist(
     e_state,                # plain list OR numba.typed.List
     X_lm: np.ndarray,
     Pabs: float
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     
     """Parallel hot‑carrier generation with full (l,m) summation."""
     if not isinstance(e_state, _NList):
@@ -402,4 +416,57 @@ def hot_e_dist(
         e_state = tmp
         
     return _hot_e_dist_parallel(a_nm, hv_eV, E_F, tau_e_fs, e_state, X_lm, Pabs)
+
+# =============================================================================
+# 5. Cumulative hot-electron yield per absorbed photon  N_e(ε)
+#     N_e(ε) = (ħω / Pabs) * Σ_{E_f ≥ ε} Γ_e(E_f)
+#     Here Γ_e(E_f) are the per-level generation rates in Te_raw_
+# =============================================================================
+
+def _flatten_energies_from_states(e_state: List[QWLevelSet]) -> np.ndarray:
+    """Return the 1D array of all final-state energies E_f (eV) in the same
+    order used internally when building transition blocks."""
+    lmax = len(e_state)
+    counts = [es.Eb.size for es in e_state]
+    N = int(np.sum(np.array(counts)))
+    E_all = np.empty(N, dtype=np.float64)
+    s = 0
+    for es in e_state:
+        e = es.Eb.real.astype(np.float64)
+        E_all[s:s+e.size] = e
+        s += e.size
+    return E_all
+
+def hot_e_cdf_per_photon(
+    Te_raw_: np.ndarray, e_state, hv_eV: float, Pabs: float, *,
+    E_F: float = 0.0, eps_eval: np.ndarray | None = None, relative_to_EF: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    # energies (in the same column order as Te_raw_)
+    E_all = _flatten_energies_from_states(e_state)
+    eps_ref = (E_all - E_F) if relative_to_EF else E_all
+
+    # sort by ε and build right-cumulative sums
+    idx = np.argsort(eps_ref)
+    eps_sorted   = eps_ref[idx]
+    Gamma_sorted = Te_raw_[:, idx]                  # (Ntau, N)
+    Gamma_cum    = np.cumsum(Gamma_sorted[:, ::-1], axis=1)[:, ::-1]
+
+    # row-wise totals (per τ)
+    totals = Gamma_sorted.sum(axis=1, keepdims=True)
+    totals[totals == 0.0] = 1.0  # avoid /0 in pathological cases
+
+    # This IS the “per absorbed photon” FoM (hv/Pabs cancels after rescaling)
+    Ne_all_eps = Gamma_cum / totals                  # (Ntau, N)
+
+    if eps_eval is None:
+        return Ne_all_eps, eps_sorted
+    else:
+        eps_eval = np.asarray(eps_eval, dtype=np.float64)
+        Ntau, M = Te_raw_.shape[0], eps_eval.size
+        Ne = np.zeros((Ntau, eps_eval.size), dtype=np.float64)
+        for m, th in enumerate(eps_eval):
+            j = np.searchsorted(eps_sorted, th, side="left")
+            Ne[:, m] = 0.0 if j >= eps_sorted.size else (Gamma_cum[:, j] / totals[:, 0])
+        return Ne, eps_eval
+
 
