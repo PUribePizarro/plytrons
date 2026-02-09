@@ -1,0 +1,5 @@
+# Clustering tol = 0.080 eV
+resonance 1: center ~ 3.0181 eV, members=1
+resonance 2: center ~ 3.2995 eV, members=1
+resonance 3: center ~ 3.5277 eV, members=9
+resonance 4: center ~ 3.7575 eV, members=10

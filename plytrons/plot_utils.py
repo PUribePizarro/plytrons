@@ -558,6 +558,169 @@ def print_active_lm(BCM, thr=1.0):
 
     print(*[f"Active l,m -> l={ll}, m={mm}" for ll, mm in zip(l, m)], sep="\n")
 
+def lorentzian_weight(hv, hv0, Gamma_exc_eV):
+    """Unit-area Lorentzian in hv (eV). Gamma_exc_eV is FWHM."""
+    g2 = 0.5 * Gamma_exc_eV
+    return (1/np.pi) * g2 / ((hv - hv0)**2 + g2**2)
+
+def omega_average_spectra(
+    hv0,
+    Gamma_exc_eV,
+    compute_spectrum_at_hv,
+    hv_span_factor=3.0,
+    nhv=31,
+    E_ref=None,
+    interp_kind="linear",
+):
+    """
+    Compute excitation-averaged hot-carrier spectra around hv0.
+
+    Parameters
+    ----------
+    hv0 : float
+        Central excitation energy (eV).
+    Gamma_exc_eV : float
+        Excitation bandwidth FWHM (eV) for Lorentzian S(hv;hv0).
+    compute_spectrum_at_hv : callable
+        Function: hv -> (E_grid, Ge(E), Gh(E))
+        IMPORTANT: E_grid should be in eV relative to EF, consistent across runs.
+    hv_span_factor : float
+        Integrate over hv in [hv0 - span, hv0 + span] where span = hv_span_factor * Gamma_exc_eV.
+        3*Gamma is usually enough for Lorentzian tails in practice.
+    nhv : int
+        Number of hv samples.
+    E_ref : array or None
+        Common energy grid for output. If None, uses the E_grid from the first hv.
+    interp_kind : str
+        Currently only linear interpolation via np.interp (fast and stable).
+
+    Returns
+    -------
+    E_ref, Ge_avg, Gh_avg, hv_grid, w_norm
+    """
+    span = hv_span_factor * Gamma_exc_eV
+    hv_grid = np.linspace(hv0 - span, hv0 + span, nhv)
+
+    # raw weights (Lorentzian)
+    w = lorentzian_weight(hv_grid, hv0, Gamma_exc_eV)
+
+    # If hv grid uniform, normalize directly; if you later use nonuniform, include dhv factors.
+    w_norm = w / np.sum(w)
+
+    # Evaluate first spectrum to set reference energy grid
+    E0, Ge0, Gh0 = compute_spectrum_at_hv(hv_grid[0])
+    if E_ref is None:
+        E_ref = E0
+
+    # Helper: interpolate onto E_ref
+    def to_Eref(E, y):
+        if np.array_equal(E, E_ref):
+            return y
+        # np.interp requires ascending x
+        return np.interp(E_ref, E, y, left=0.0, right=0.0)
+
+    Ge_acc = np.zeros_like(E_ref, dtype=float)
+    Gh_acc = np.zeros_like(E_ref, dtype=float)
+
+    # accumulate
+    for wk, hv in zip(w_norm, hv_grid):
+        E, Ge, Gh = compute_spectrum_at_hv(hv)
+        Ge_acc += wk * to_Eref(E, Ge)
+        Gh_acc += wk * to_Eref(E, Gh)
+
+    return E_ref, Ge_acc, Gh_acc, hv_grid, w_norm
+
+
+# def convert_raw_hot(Te, Th, E, dE_factor=1.0, nplot=1000, renormalize=True):
+#     """
+#     Convert discrete (Te, Th) sampled at irregular energies E into smooth
+#     energy-resolved distributions on a uniform grid using Lorentzian broadening.
+
+#     Implements:
+#         T_plot(Ej) = sum_i T(Ei) * w_i * L(Ej - Ei; Gamma)
+#     where w_i are trapezoidal quadrature weights for nonuniform Ei, and
+#     L is a unit-area Lorentzian with FWHM Gamma.
+
+#     Parameters
+#     ----------
+#     Te, Th : array_like
+#         Discrete spectra values at energies E (same length as E).
+#     E : array_like
+#         Energies (eV). Can be unsorted and nonuniform.
+#     dE_factor : float
+#         Controls Lorentzian width relative to output grid spacing:
+#             Gamma = dE_factor * (E_plot[1] - E_plot[0])
+#         (Gamma is FWHM, matching your lorentz_unit definition.)
+#     nplot : int
+#         Number of points in output uniform grid.
+#     renormalize : bool
+#         If True, rescales the smoothed curves so that
+#             ∫ T_plot(E) dE == Σ T(Ei) w_i
+#         (helps remove small edge/grid truncation errors).
+
+#     Returns
+#     -------
+#     E_plot : (nplot,) ndarray
+#         Uniform energy grid spanning [min(E), max(E)].
+#     Te_plot, Th_plot : (nplot,) ndarray
+#         Smoothed spectra on E_plot (same units as Te/Th per eV if Te/Th were per state).
+#     """
+#     Te = np.asarray(Te, dtype=float).ravel()
+#     Th = np.asarray(Th, dtype=float).ravel()
+#     E  = np.asarray(E,  dtype=float).ravel()
+
+#     # basic sanity / finite mask
+#     m = np.isfinite(E) & np.isfinite(Te) & np.isfinite(Th)
+#     E, Te, Th = E[m], Te[m], Th[m]
+
+#     if E.size < 2:
+#         E_plot = np.linspace(np.nanmin(E), np.nanmax(E), nplot) if E.size == 1 else np.linspace(0, 1, nplot)
+#         return E_plot, np.zeros_like(E_plot), np.zeros_like(E_plot)
+
+#     # sort by energy
+#     idx = np.argsort(E)
+#     E, Te, Th = E[idx], Te[idx], Th[idx]
+
+#     # uniform output grid
+#     E_plot = np.linspace(E.min(), E.max(), int(nplot))
+#     dE_plot = E_plot[1] - E_plot[0]
+
+#     # Lorentzian FWHM (Gamma)
+#     Gamma = float(dE_factor) * float(dE_plot)
+#     g2 = 0.5 * Gamma  # half-width at half-maximum
+
+#     # unit-area Lorentzian kernel L(x;Gamma)
+#     def L(x):
+#         return (1.0 / np.pi) * g2 / (x*x + g2*g2)
+
+#     # trapezoid weights for nonuniform E (approx dE around each point)
+#     w = np.empty_like(E)
+#     w[1:-1] = 0.5 * (E[2:] - E[:-2])
+#     w[0]    = (E[1] - E[0])
+#     w[-1]   = (E[-1] - E[-2])
+
+#     # compute smoothed curves: sum_i T(Ei) * w_i * L(Ej - Ei)
+#     # vectorized with broadcasting (nplot x nE)
+#     K = L(E_plot[:, None] - E[None, :])            # (nplot, nE)
+#     Te_plot = (K * (Te * w)[None, :]).sum(axis=1)  # (nplot,)
+#     Th_plot = (K * (Th * w)[None, :]).sum(axis=1)  # (nplot,)
+
+#     if renormalize:
+#         # enforce area conservation on the finite E_plot window/grid
+#         target_e = np.sum(Te * w)
+#         target_h = np.sum(Th * w)
+#         area_e = np.trapz(Te_plot, E_plot)
+#         area_h = np.trapz(Th_plot, E_plot)
+
+#         if area_e != 0.0 and np.isfinite(area_e):
+#             Te_plot *= (target_e / area_e)
+#         if area_h != 0.0 and np.isfinite(area_h):
+#             Th_plot *= (target_h / area_h)
+
+#     return E_plot, Te_plot, Th_plot
+
+
+
 def convert_raw_hot(Te, Th, E, dE_factor):
     idx = np.argsort(E)
     E = E[idx]; Te = Te[idx]; Th = Th[idx]
@@ -613,8 +776,6 @@ def hot_carriers_plot(Te, Th, Te_raw, Th_raw,
     - Returns nothing (shows the plot and saves it).
     """
     # Units/arrays
-    Te = Te/1000.0
-    Th = Th/1000.0
     Te_raw = Te_raw
     Th_raw = Th_raw
 
@@ -636,9 +797,9 @@ def hot_carriers_plot(Te, Th, Te_raw, Th_raw,
     mask_h = (x <= EF) & (x >= EF - delta)
 
     # plot
-    fig, ax = plt.subplots(figsize=(20, 4.5))
-    ax.fill_between((x - EF)[mask_e], Te_x[mask_e], color='r', alpha=0.38, label='Electrons (dens.)')
-    ax.fill_between((x - EF)[mask_h], Th_x[mask_h], color='b', alpha=0.38, label='Holes (dens.)')
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.fill_between((x - EF)[mask_e], Te_x[mask_e], color='r', alpha=0.38)
+    ax.fill_between((x - EF)[mask_h], Th_x[mask_h], color='b', alpha=0.38)
 
     # SECOND Y-AXIS for bars
     ax2 = ax.twinx()
@@ -653,8 +814,9 @@ def hot_carriers_plot(Te, Th, Te_raw, Th_raw,
 
     ax.set_xlim(-delta, delta)
     ax.set_xlabel('Hot carrier energy relative to Fermi level (eV)')
-    ax.set_ylabel(r'Hot carrier generation rate density $[{10}^{-3}\mathrm{eV}^{-1}\,\mathrm{ps}^{-1}\,\mathrm{nm}^{-3}]$')
-    ax2.set_ylabel('Hot carrier generation rate per particle $[\mathrm{ps}^{-1}]$')
+    ax.set_ylabel(r'HC generation rate density')
+    # ax.set_ylabel(r'HC generation rate density $[{10}^{-3}\mathrm{eV}^{-1}\,\mathrm{ps}^{-1}\,\mathrm{nm}^{-3}]$')
+    ax2.set_ylabel('HC generation rate per particle $[\mathrm{ps}^{-1}]$')
 
     # y-limits
     ax.set_ylim(0, 1.05 * max(Te_x[mask_e].max(initial=0), Th_x[mask_h].max(initial=0)))
@@ -667,7 +829,7 @@ def hot_carriers_plot(Te, Th, Te_raw, Th_raw,
 
     tau_fs = float(np.atleast_1d(tau_e)[0])
     ax.set_title(rf'Nanoparticle N°{Np}, Resonance peak N°{peak}, D = {D} nm, '
-                 rf'$\tau = ${tau_fs/1000:.2f} ps, $h\nu$ = {hv:.2f} eV')
+                 rf'$\tau = ${tau_fs/1000:.2f} ps, $h\nu$ = {hv:.3f} eV')
     ax.grid(True, ls=':')
     plt.tight_layout() 
 
@@ -677,7 +839,7 @@ def hot_carriers_plot(Te, Th, Te_raw, Th_raw,
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path, dpi=300, bbox_inches="tight",transparent=True)
 
     # Show and close (no return)
     plt.show()
@@ -1037,7 +1199,301 @@ def plot_Ne_cdf_steps(
         if close:
             plt.close(fig)
 
+def hot_carrier_gap_dynamics_gif(
+    Te_tau_list, Th_tau_list, Te_raw_tau_list, Th_raw_tau_list,
+    e_states,
+    *,
+    gap_values_nm,        # sequence of Δ values (same order as lists)
+    hv_list,              # sequence of photon energies (eV), one per Δ frame
+    EF: float,
+    D: float,
+    tau_fs: float,        # fixed lifetime shown in the title (fs)
+    dE_factor: float = 5,
+    Ewin: float = 4.0,    # energy window around EF for the lines/fills (eV)
+    efield=None,
+    fps: int = 12,
+    bar_width: float = 2.0e-2,
+    out_path: str | Path | None = None,
+    title_prefix: str = "",
+):
+    """
+    Animate hot-carrier spectra across *gap* Δ (delta_) for a fixed τ.
 
+    Parameters
+    ----------
+    Te_tau_list, Th_tau_list : list[np.ndarray]
+        One 1D array per Δ (length = number of QW levels), for the *smoothed*
+        electron/hole rates at the chosen τ. If you only have the raw arrays,
+        pass them in Te_raw_tau_list/Th_raw_tau_list and let this function do
+        the line smoothing (done here).
+    Te_raw_tau_list, Th_raw_tau_list : list[np.ndarray]
+        One 1D array per Δ (length = number of QW levels), *raw* per-level rates
+        at the chosen τ (used for the bar plot on the secondary y-axis).
+    e_states : QW level set (used only to reconstruct the energy grid E_all)
+    gap_values_nm : array-like
+        Δ values (nm) in the same order as the lists.
+    hv_list : array-like
+        Photon energy (eV) to use on each frame (e.g., the tracked resonance energy at that Δ).
+    EF : float
+        Fermi level (eV).
+    D : float
+        Sphere diameter (nm), for labeling only.
+    tau_fs : float
+        Lifetime (fs) used for these per-Δ snapshots (purely cosmetic in title).
+    dE_factor : float
+        Spectral smoothing factor passed to convert_raw_hot.
+    Ewin : float
+        Half-window (eV) shown around EF for the smoothed lines.
+    efield : EField | None
+        Used to append polarization tag to the default filename.
+    fps : int
+        GIF framerate.
+    out_path : str | Path | None
+        If None, a default filename with polarization tag is created.
+    title_prefix : str
+        Optional string prepended to the title (e.g., "struct=5 · sphere 2 · peak 1").
+    """
+    # ------------ sanity / prep ------------
+    gaps = np.asarray(gap_values_nm, float)
+    hv_list = np.asarray(hv_list, float)
+    nF = len(gaps)
+
+    if not (len(Te_tau_list) == len(Th_tau_list) == len(Te_raw_tau_list) == len(Th_raw_tau_list) == nF):
+        raise ValueError("All input lists must have the same length as gap_values_nm.")
+
+    # energies associated to the level indices
+    E_all = np.concatenate([es.Eb[es.Eb != 0] for es in e_states]).real
+    N = E_all.size
+
+    # ensure arrays
+    Te_tau_list   = [np.asarray(v, float).reshape(N) for v in Te_tau_list]
+    Th_tau_list   = [np.asarray(v, float).reshape(N) for v in Th_tau_list]
+    Te_raw_list   = [np.asarray(v, float).reshape(N) for v in Te_raw_tau_list]
+    Th_raw_list   = [np.asarray(v, float).reshape(N) for v in Th_raw_tau_list]
+
+    to_ps = 1000.0  # fs → ps
+
+    # Pre-compute global y-limits across all frames for stable axes
+    def frame_envelopes(i):
+        # smooth lines for this frame
+        x, Te_x, Th_x = convert_raw_hot(Te_tau_list[i], Th_tau_list[i], E_all, dE_factor)
+        s = to_ps / max(hv_list[i], 1e-12)
+        Te_x *= s; Th_x *= s
+        mask_e = (x >= EF) & (x <= EF + Ewin)
+        mask_h = (x <= EF) & (x >= EF - Ewin)
+        y1 = 0.0
+        if np.any(mask_e): y1 = max(y1, float(Te_x[mask_e].max()))
+        if np.any(mask_h): y1 = max(y1, float(Th_x[mask_h].max()))
+        y2 = max(float(Te_raw_list[i].max(initial=0)), float(Th_raw_list[i].max(initial=0))) * to_ps
+        return y1, y2
+
+    if nF == 0:
+        raise ValueError("No frames to animate (gap_values_nm is empty).")
+
+    YMAX_lines = 1.05 * max(frame_envelopes(i)[0] for i in range(nF))
+    YMAX_bars  = 1.20 * max(frame_envelopes(i)[1] for i in range(nF))
+
+    # ------------ figure / artists ------------
+    fig, ax = plt.subplots(figsize=(20, 4.5))
+    line_e, = ax.plot([], [], lw=1.8, color='r', alpha=0.5)
+    line_h, = ax.plot([], [], lw=1.8, color='b', alpha=0.5)
+    fill_e = None
+    fill_h = None
+
+    # bars on twin axis
+    ax2 = ax.twinx()
+    x_bar = E_all - EF
+    bars_e = ax2.bar(x_bar, np.zeros_like(x_bar), width=bar_width, color='firebrick', alpha=1, label='Electrons')
+    bars_h = ax2.bar(x_bar, np.zeros_like(x_bar), width=bar_width, color='royalblue',  alpha=1, label='Holes')
+
+    # guides
+    ax.axvline(0.0, ls='--', lw=1, alpha=0.5)
+    # we draw ±hv in each frame inside update(); initial state shows nothing
+
+    ax.set_xlim(-Ewin, +Ewin)
+    ax.set_ylim(0, YMAX_lines)
+    ax2.set_ylim(0, YMAX_bars)
+
+    ax.set_xlabel(r'Hot carrier energy relative to $E_F$ (eV)')
+    ax.set_ylabel(r'Hot carrier generation rate density $[{10}^{-3}\mathrm{eV}^{-1}\,\mathrm{ps}^{-1}\,\mathrm{nm}^{-3}]$')
+    ax2.set_ylabel(r'Hot carrier generation rate per particle $[\mathrm{ps}^{-1}]$')
+    ax.grid(True, ls=':')
+
+    # legend (lines + bars)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, loc='upper right')
+
+    # ------------ frame helpers ------------
+    def make_frame_data(i):
+        x, Te_x, Th_x = convert_raw_hot(Te_tau_list[i], Th_tau_list[i], E_all, dE_factor)
+        s = to_ps / max(hv_list[i], 1e-12)
+        Te_x *= s; Th_x *= s
+        mask_e = (x >= EF) & (x <= EF + Ewin)
+        mask_h = (x <= EF) & (x >= EF - Ewin)
+        return (x - EF)[mask_e], Te_x[mask_e], (x - EF)[mask_h], Th_x[mask_h]
+
+    # keep references to the ±hv lines so we can remove/redraw them each frame
+    hv_lines = []
+
+    def init():
+        nonlocal fill_e, fill_h, hv_lines
+        line_e.set_data([], [])
+        line_h.set_data([], [])
+        if fill_e: fill_e.remove(); fill_e = None
+        if fill_h: fill_h.remove(); fill_h = None
+        for r in list(bars_e) + list(bars_h):
+            r.set_height(0.0)
+        for ln in hv_lines:
+            ln.remove()
+        hv_lines = []
+        ax.set_title('')
+        return [line_e, line_h, *bars_e.patches, *bars_h.patches]
+
+    def update(i):
+        nonlocal fill_e, fill_h, hv_lines
+        xe, ye, xh, yh = make_frame_data(i)
+
+        # lines for legend/edges
+        line_e.set_data(xe, ye)
+        line_h.set_data(xh, yh)
+
+        # refresh fills
+        if fill_e: fill_e.remove()
+        fill_e = ax.fill_between(xe, 0.0, ye, color='r', alpha=0.30, label='_nolegend_')
+        if fill_h: fill_h.remove()
+        fill_h = ax.fill_between(xh, 0.0, yh, color='b', alpha=0.30, label='_nolegend_')
+
+        # bars
+        he = to_ps * Te_raw_list[i]
+        hh = to_ps * Th_raw_list[i]
+        for rect, h in zip(bars_e, he): rect.set_height(float(h))
+        for rect, h in zip(bars_h, hh): rect.set_height(float(h))
+
+        # update ±hv markers
+        for ln in hv_lines:
+            ln.remove()
+        hv_lines = []
+        hv = float(hv_list[i])
+        hv_lines.append(ax.axvline(+hv, ls='--', lw=1, color='gray', alpha=0.6))
+        hv_lines.append(ax.axvline(-hv, ls='--', lw=1, color='gray', alpha=0.6))
+
+        # title
+        tau_ps = tau_fs / 1000.0
+        prefix = (title_prefix + " · ") if title_prefix else ""
+        ax.set_title(
+            rf"{prefix}$\Delta$ = {gaps[i]:.2f} nm, "
+            rf"$\tau$ = {tau_ps:.2f} ps, $h\nu$ = {hv:.2f} eV,  D = {D:.1f} nm  (frame {i+1}/{len(gaps)})"
+        )
+        return [line_e, line_h, *bars_e.patches, *bars_h.patches, *hv_lines]
+
+    anim = FuncAnimation(fig, update, frames=nF, init_func=init, blit=False,
+                         interval=int(1000 / max(fps,1)))
+    # default output path
+    if out_path is None or str(out_path).strip() == "":
+        # use hv of first frame for the name; append polarization tag if available
+        base = f"HC_gap_dynamics_D{D:.1f}nm_tau{int(tau_fs)}fs_hv{hv_list[0]:.2f}eV.gif"
+        out_path = path_with_polarization(base, efield) if efield is not None else Path(base)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = PillowWriter(fps=fps, metadata={'artist': 'Simulation'})
+    anim.save(out_path, writer=writer, dpi=120)
+    plt.close(fig)
+
+    # try to preview when in notebook
+    try:
+        from IPython.display import Image, display, HTML
+        display(HTML(f"<b>Saved GIF:</b> {out_path}"))
+        display(Image(filename=out_path))
+    except Exception:
+        pass
+
+def absorption_gap_gif(
+    energy_eV: np.ndarray,
+    Qabs_frames: list[np.ndarray],          # one Qabs(energy) array per Δ
+    *,
+    gap_values_nm: np.ndarray,              # same length as Qabs_frames
+    hv_lines_per_delta: list[list[float]],  # list of lists of hv (eV) per frame
+    title_prefix: str = "",
+    fps: int = 12,
+    out_path: str | Path | None = None,
+    ymargin: float = 1.08,                  # top padding for y-limit
+):
+    """
+    Animate absorption Q_abs(ℏω) across gap Δ.
+    Draw vertical lines at every hv present in the current frame.
+
+    Parameters
+    ----------
+    energy_eV : (M,) array of photon energies.
+    Qabs_frames : list of (M,) arrays, one per Δ frame.
+    gap_values_nm : (NΔ,) array of gap values (nm).
+    hv_lines_per_delta : list of lists; per frame, a list of energies (eV) to mark.
+    """
+    energy_eV = np.asarray(energy_eV, float).ravel()
+    NΔ = len(Qabs_frames)
+    assert NΔ == len(gap_values_nm) == len(hv_lines_per_delta), "Frame lists must align with gap_values_nm."
+
+    # Robust y-limit across frames
+    ymax = 0.0
+    for Qa in Qabs_frames:
+        if Qa is None: continue
+        Qa = np.asarray(Qa, float).ravel()
+        if Qa.size: ymax = max(ymax, float(np.nanmax(Qa)))
+    if not np.isfinite(ymax) or ymax <= 0:
+        ymax = 1.0
+
+    fig, ax = plt.subplots(figsize=(8.4, 5.0))
+    (line,) = ax.plot([], [], lw=2.0, color='k')
+    ax.set_xlim(float(energy_eV.min()), float(energy_eV.max()))
+    ax.set_ylim(0.0, ymargin * ymax)
+    ax.set_xlabel("Photon energy (eV)")
+    ax.set_ylabel("Absorption efficiency $Q_{\\mathrm{abs}}$")
+    ax.grid(True, ls=":")
+    vlines = []  # will hold Line2D objects for hv markers
+
+    def init():
+        line.set_data([], [])
+        for ln in vlines:
+            try: ln.remove()
+            except Exception: pass
+        vlines.clear()
+        ax.set_title("")
+        return [line]
+
+    def update(i):
+        # update curve
+        Qa = np.asarray(Qabs_frames[i], float).ravel()
+        line.set_data(energy_eV, Qa)
+
+        # redraw hv vertical lines for this frame
+        for ln in vlines:
+            try: ln.remove()
+            except Exception: pass
+        vlines.clear()
+        for hv in hv_lines_per_delta[i]:
+            vlines.append(ax.axvline(float(hv), ls='--', lw=1.2, color='crimson', alpha=0.85))
+
+        ax.set_title(f"{title_prefix}  Δ = {gap_values_nm[i]:.2f} nm  (frame {i+1}/{NΔ})")
+        return [line, *vlines]
+
+    anim = FuncAnimation(fig, update, frames=NΔ, init_func=init, blit=False,
+                         interval=int(1000/max(fps,1)))
+    if out_path is None or str(out_path).strip() == "":
+        out_path = Path("absorption_gap.gif")
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = PillowWriter(fps=fps, metadata={'artist': 'Simulation'})
+    anim.save(out_path, writer=writer, dpi=140)
+    plt.close(fig)
+
+    try:
+        from IPython.display import Image, display, HTML
+        display(HTML(f"<b>Saved GIF:</b> {out_path}"))
+        display(Image(filename=out_path))
+    except Exception:
+        pass
 
 
 

@@ -19,7 +19,7 @@ __all__ = ["hot_e_dist"]
 # =============================================================================
 
 @nb.njit(cache=True, fastmath=True)
-def _fermi_dirac(E: np.ndarray, E_F: float, T: float = 300.0) -> np.ndarray:
+def _fermi_dirac(E: np.ndarray, E_F: float, T: float = 0.0001) -> np.ndarray:
     """Vectorised Fermi–Dirac occupation *f(E)* (Numba‑accelerated)."""
     k_B = 8.617333262e-5  # eV K⁻¹
     return 1.0 / (np.exp((E - E_F) / (k_B * T)) + 1.0)
@@ -292,7 +292,7 @@ def _M_transition_squared(
 # 3. Parallel driver with full (l,m) summation
 # =============================================================================
 
-@nb.njit(fastmath=False, parallel=True)
+@nb.njit(fastmath=True, parallel=True)
 def _hot_e_dist_parallel(
     a_nm: float,
     hv_eV: float,
@@ -356,12 +356,12 @@ def _hot_e_dist_parallel(
 
         TTe = 4.0/tau_dx * fd_i * (1.0 - fd_f) * (
             Mfi_2_all/denom_e
-            #   + Mfi_2_all.T/denom_h
+              + Mfi_2_all.T/denom_h
             )
         
         TTh = 4.0/tau_dx * fd_f * (1.0 - fd_i) * (
             Mfi_2_all/denom_h
-            #   + Mfi_2_all.T/denom_e
+              + Mfi_2_all.T/denom_e
             )
 
         Te_raw = TTe.sum(axis=1)
@@ -369,15 +369,37 @@ def _hot_e_dist_parallel(
 
         # --- Normalisation -----------------------------------------------------
 
+        P_diss = 0.0
+        for f in range(N):
+            Ef = E_all[f]
+            for i_ in range(N):
+                dE = Ef - E_all[i_]
+                if dE > 0.0:
+                    P_diss += dE * (TTe[f, i_])
+
+        if P_diss <= 0.0 or not np.isfinite(P_diss):
+            P_diss = 1e-300
+
+        Pabs_fs = Pabs  # eV/fs
+        S = Pabs_fs / P_diss
+
+
+        # # after you build the per-transition rate matrix R_fi (shape Nf x Ni)
+        # # (in your notation, something like TTe before summing)
+        # DeltaE = (EE_f - EE_i)  # eV
+        # P_diss = np.sum(DeltaE * TTe)  # eV/fs  (or eV/ps depending on your tau unit)
+        # S = Pabs / P_diss
+
+
         Vol = 4/3*np.pi*a_nm**3                # Volume of sphere (nm^3)
-        Gamma_e_total = np.sum(Te_raw)     # total electron gen. rate = sum over f (per fs)
-        S = Pabs / (hv_eV * Gamma_e_total)     # dimensionless scaling
+        # Gamma_e_total = np.sum(Te_raw)     # total electron gen. rate = sum over f (per fs)
+        # S = Pabs / (hv_eV * Gamma_e_total)     # dimensionless scaling
     
         
         Te[i] = S * Te_raw/Vol
         Th[i] = S * Th_raw/Vol
-        Te_raw_[i] = Te_raw
-        Th_raw_[i] = Th_raw
+        Te_raw_[i] = S * Te_raw
+        Th_raw_[i] = S * Th_raw
 
     # ---- sort by energy (lowest → highest) and build a SORTED matrix ------
     order = np.argsort(E_all)
@@ -391,7 +413,7 @@ def _hot_e_dist_parallel(
             j_old = order[jj]
             Mfi_2_sorted[ii, jj] = Mfi_2_all[i_old, j_old]
 
-    return Te, Th, Te_raw_, Th_raw_, Mfi_2_sorted, E_sorted
+    return Te, Th, Te_raw_, Th_raw_, Mfi_2_sorted, E_sorted, S, Pabs_fs, P_diss
 
 
 # =============================================================================
@@ -470,3 +492,59 @@ def hot_e_cdf_per_photon(
         return Ne, eps_eval
 
 
+def count_eh_generated(
+    Te_raw_: np.ndarray,
+    Th_raw_: np.ndarray,
+    *,
+    t_fs: float | np.ndarray,
+    tau_index: int = 0,
+    return_level_resolved: bool = False,
+):
+    """
+    Count generated electrons and holes over a time window.
+
+    Parameters
+    ----------
+    Te_raw_, Th_raw_ : (Ntau, N) arrays
+        Level-resolved generation rates AFTER your scaling S:
+            Te_raw_[i, f] = electron generation rate into final level f
+            Th_raw_[i, f] = hole     generation rate into final level f
+        Units: "per fs" if your internal time is fs (consistent with tau_e_fs).
+
+    t_fs : float or array
+        Time duration in femtoseconds over which to count carriers.
+        If array, you get a time series of cumulative counts.
+
+    tau_index : int
+        Which row (i) to use (corresponding to tau_e_fs[i]).
+
+    return_level_resolved : bool
+        If True, also return per-level counts (same shape as N or (T,N)).
+
+    Returns
+    -------
+    Ne, Nh : float or (T,) arrays
+        Total number of electrons and holes generated in time t_fs.
+
+    (optional) Ne_levels, Nh_levels : arrays
+        Level-resolved counts. Shape (N,) if scalar t_fs, else (T, N).
+    """
+    Te_row = np.asarray(Te_raw_[tau_index], dtype=np.float64)
+    Th_row = np.asarray(Th_raw_[tau_index], dtype=np.float64)
+
+    t = np.asarray(t_fs, dtype=np.float64)
+
+    # total rates (per fs)
+    Ge = Te_row.sum()
+    Gh = Th_row.sum()
+
+    # totals (dimensionless counts)
+    Ne = Ge * t
+    Nh = Gh * t
+
+    if not return_level_resolved:
+        return Ne, Nh
+
+    Ne_levels = t[..., None] * Te_row[None, ...] if t.ndim else t * Te_row
+    Nh_levels = t[..., None] * Th_row[None, ...] if t.ndim else t * Th_row
+    return Ne, Nh, Ne_levels, Nh_levels

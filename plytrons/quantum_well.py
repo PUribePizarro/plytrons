@@ -2,6 +2,7 @@ import numpy as np
 import numba as nb
 from dataclasses import dataclass
 from typing import List as PyList   # avoid clashing with numba.typed.List
+from tqdm.auto import tqdm
 from plytrons.math_utils import js_real, nb_meshgrid
 from plytrons.math_utils import hbar, me
 from numba import float64, complex128
@@ -76,7 +77,7 @@ def _bisection_root(f, l, a, E_low, E_high, max_iter, tol):
 def _bound_states_ragged(a_nm, lmax=200, V0=10.0,
                      nE_coarse=2000, max_iter=40, tol=1e-6):
     """
-    Adaptive search for bound energies of a finite spherical quantum well.
+    Adaptive search for bound energies of a infinite spherical quantum well.
 
     Parameters
     ----------
@@ -251,3 +252,204 @@ def get_normalization(a, E_bound):
         A[l,:len(E_l)] = A_l
 
     return A
+
+def compute_qw_states(a, *, desc="QW", show_progress=True):
+    """Run the 3 quantum-well steps with a tiny progress bar."""
+    bar = tqdm(total=3, desc=f"{desc} a={a:.3f}", unit="step", disable=not show_progress)
+    E_matrix = get_bound_states(a);              bar.update(1)
+    A_matrix = get_normalization(a, E_matrix);   bar.update(1)
+    e_states = e_state_assembly(E_matrix, A_matrix); bar.update(1)
+    bar.close()
+    return E_matrix, A_matrix, e_states
+
+def compute_qw_states_batch(a_list, *, show_progress=True):
+    """Process multiple 'a' values with an outer progress bar."""
+    results = []
+    for a in tqdm(a_list, desc="QW batch", unit="a", disable=not show_progress):
+        results.append(compute_qw_states(a, desc="QW", show_progress=False))
+    return results
+
+# ================================================================
+# 1) Electrons per nanoparticle (your formula)
+# ================================================================
+def electrons_per_nanoparticle(D_nm: float,
+                               N_atoms_uc: int,
+                               alat_nm: float) -> int:
+    """
+    Estimate the number of conduction electrons in a spherical nanoparticle.
+
+    Parameters
+    ----------
+    D_nm : float
+        Nanoparticle diameter [nm].
+    N_atoms_uc : int
+        Number of atoms per unit cell (e.g. 4 for fcc).
+    alat_nm : float
+        Lattice constant (cubic unit cell edge) [nm].
+
+    Returns
+    -------
+    Ne : int
+        Integer number of conduction electrons, assuming 1 free e⁻ per atom:
+            Ne = int( N_atoms_uc * (4/3 π (D/2)^3) / alat^3 )
+    """
+    vol_np = (4.0 / 3.0) * np.pi * (0.5 * D_nm)**3   # sphere volume
+    vol_uc = alat_nm**3                              # unit cell volume
+    Ne_real = N_atoms_uc * vol_np / vol_uc
+    return int(np.floor(Ne_real))
+
+
+# ================================================================
+# 2) Fill QW states in *increasing energy* (Fermi filling)
+#    - DOES NOT remove states
+#    - returns occupation per (ℓ, n) level
+# ================================================================
+def fill_qw_states_by_energy(E_levels: np.ndarray,
+                             D_nm: float,
+                             N_atoms_uc: int,
+                             alat_nm: float,
+                             spin_deg: int = 2):
+    """
+    Fill the spherical quantum-well bound states in order of increasing energy
+    with a finite number of electrons given by the nanoparticle geometry.
+
+    We keep ALL levels in E_levels; we only compute how many electrons
+    occupy each (ℓ, n) level at T = 0.
+
+    Parameters
+    ----------
+    E_levels : np.ndarray
+        2D padded matrix of bound energies (as from get_bound_states /
+        compute_qw_states). Index convention: E_levels[ℓ, n].
+        Non-existing levels should be NaN or <= 0.
+    D_nm : float
+        Nanoparticle diameter [nm].
+    N_atoms_uc : int
+        Number of atoms per unit cell (e.g. 4 for fcc).
+    alat_nm : float
+        Lattice constant [nm].
+    spin_deg : int, optional
+        Spin degeneracy (2 for electrons).
+
+    Returns
+    -------
+    occ : np.ndarray
+        Same shape as E_levels. occ[ℓ, n] is the number of electrons
+        occupying that (ℓ, n) level, between 0 and g_ℓ = spin_deg*(2ℓ+1).
+        Levels that do not exist or are empty have occ = 0.
+    EF : float
+        Fermi energy (energy of last filled / partially filled level).
+        NaN if no level is occupied.
+    Ne : int
+        Total number of electrons from the geometry (requested).
+    electrons_left : int
+        Electrons that could not be placed because there were not enough
+        available single-particle slots (normally should be 0 if your
+        energy window and lmax are large enough).
+    """
+    # total electrons from your geometrical formula
+    Ne = electrons_per_nanoparticle(D_nm, N_atoms_uc, alat_nm)
+
+    L, Nmax = E_levels.shape
+    occ = np.zeros_like(E_levels, dtype=float)
+    entries = []
+
+    # 1) Collect all valid levels with their degeneracies
+    for l in range(L):
+        g_l = spin_deg * (2*l + 1)       # degeneracy 2(2ℓ+1)
+        row = E_levels[l]
+        for n in range(Nmax):
+            E = row[n]
+            if not np.isfinite(E) or E <= 0.0:
+                continue
+            # store (energy, ℓ, n, degeneracy for this ℓ)
+            entries.append((E, l, n, g_l))
+
+    # 2) Sort by increasing energy
+    entries.sort(key=lambda t: t[0])
+
+    # 3) Fill electrons up to Ne
+    electrons_left = Ne
+    EF = np.nan
+
+    for E, l, n, g in entries:
+        if electrons_left <= 0:
+            break
+
+        if electrons_left >= g:
+            # fully occupied level
+            occ[l, n] = g
+            electrons_left -= g
+            EF = E
+        else:
+            # partially occupied frontier level
+            occ[l, n] = electrons_left
+            EF = E
+            electrons_left = 0
+            break
+
+    return occ, EF, Ne, electrons_left
+
+
+# ================================================================
+# 3) (Optional) Occupation fraction 0–1 per level
+# ================================================================
+def occupation_fraction(occ: np.ndarray, spin_deg: int = 2) -> np.ndarray:
+    """
+    Convert absolute occupations occ[ℓ, n] into fractional occupations
+    f[ℓ, n] in [0, 1], dividing by the degeneracy g_ℓ = spin_deg*(2ℓ+1).
+    """
+    L, Nmax = occ.shape
+    f = np.zeros_like(occ, dtype=float)
+    for l in range(L):
+        g_l = spin_deg * (2*l + 1)
+        if g_l <= 0:
+            continue
+        f[l] = occ[l] / g_l
+    return f
+
+
+# ================================================================
+# 4) (Optional) Convenience wrapper that runs everything
+# ================================================================
+def compute_qw_states_with_occupations(a_nm: float,
+                                       D_nm: float,
+                                       N_atoms_uc: int,
+                                       alat_nm: float,
+                                       *,
+                                       desc: str = "QW",
+                                       show_progress: bool = True):
+    """
+    Convenience wrapper:
+      1) compute QW bound states + normalisations
+      2) fill levels in increasing energy with Ne electrons
+      3) return everything
+
+    Requires your existing `compute_qw_states(a_nm, ...)` to be defined.
+    """
+    # 1) your original pipeline
+    E_matrix, A_matrix, e_states = compute_qw_states(a_nm,
+                                                     desc=desc,
+                                                     show_progress=show_progress)
+
+    # 2) Fermi filling in energy order
+    occ, EF, Ne, leftover = fill_qw_states_by_energy(
+        E_matrix,
+        D_nm=D_nm,
+        N_atoms_uc=N_atoms_uc,
+        alat_nm=alat_nm
+    )
+
+    # 3) fractional occupations (optional but handy)
+    f_occ = occupation_fraction(occ)
+
+    return {
+        "E_matrix": E_matrix,
+        "A_matrix": A_matrix,
+        "e_states": e_states,
+        "occ": occ,           # electrons per (ℓ, n)
+        "f_occ": f_occ,       # fraction 0–1 per (ℓ, n)
+        "EF": EF,             # Fermi energy
+        "Ne": Ne,             # requested electrons from geometry
+        "electrons_left": leftover
+    }
