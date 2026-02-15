@@ -13,7 +13,16 @@ import plytrons.bcm_sphere as bcm
 from scipy.constants import hbar, eV
 
 
-__all__ = ["make_results_folder"]
+__all__ = ["make_results_folder", "axis_label"]
+
+
+def axis_label(v):
+    """Return 'x', 'y', or 'z' if v is axis-aligned, else '(x,y,z)' components."""
+    try:
+        return _bcm_get_axis(v)
+    except Exception:
+        v = np.asarray(v, float).ravel()
+        return f'({v[0]:.2f},{v[1]:.2f},{v[2]:.2f})'
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -481,9 +490,9 @@ def make_results_folder(
 
     # ----- field orientation (e.g., Exkz) -----
     try:
-        orient = f"E{_bcm_get_axis(efield.e_hat)}k{_bcm_get_axis(efield.k_hat)}"
+        orient = f"E{axis_label(efield.e_hat)}k{axis_label(efield.k_hat)}"
     except Exception:
-        orient = "E?k?"  # fallback if efield lacks expected attrs
+        orient = "Eunknown"
 
     # ----- assemble name -----
     if (Np in (2, 3)) and equal_D and ((Np == 2 and shape == "line") or (Np == 3 and shape == "tri-equil")):
