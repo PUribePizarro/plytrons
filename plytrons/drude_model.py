@@ -33,23 +33,22 @@ def eps_drude_bulk(omega_eV, wp_eV = 9.07, eps_b = 4.18, gamma0 = 0.06):
 # ============================================================================= 
 
 
-def eps_drude_nano_nordlander(omega_eV, D_nm, wp_eV = 9.07, eps_b = 4.18, gamma0 = 0.06):
+def eps_drude_nano_nordlander(omega_eV, D_nm, wp_eV = 9.07, eps_b = 4.18, gamma0 = 0.06, vf = 1.39e6):
     """
     Drude con corrección de Nordlander para un nanopartícula de diámetro D_nm [nm],
     usando γ(R) = γ_bulk + ℏ v_F / R  (expresado todo en eV).
 
     omega_eV = ℏω en eV
+    vf       = Fermi velocity [m/s] (default: Silver ~1.39e6 m/s)
     """
     omega = np.asarray(omega_eV, dtype=np.complex128)
 
-    # Fermi velocity (Ag) ~ 1.39e6 m/s
-    vF = 1.39e6          # m/s
     R_m = (D_nm * 1e-9) / 2.0   # radio en metros
 
     # ℏ en eV·s (constante física, no hbar de eV·fs)
     hbar_eVs = 6.582119569e-16
 
-    gamma_size = hbar_eVs * vF / R_m      # eV
+    gamma_size = hbar_eVs * vf / R_m      # eV
     gamma_eff  = gamma0 + gamma_size      # eV
 
     return eps_b - (wp_eV**2) / (omega * (omega + 1j * gamma_eff))
