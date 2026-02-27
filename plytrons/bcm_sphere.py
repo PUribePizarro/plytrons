@@ -12,7 +12,7 @@ sub-module of `plytrons`.  See the `EField`, `BCMObject`, and
 __all__ = [
     "EField", "BCMObject",
     "Ginternal", "Gexternal", "Efield_coupling", "solve_BCM",
-    "EM_power",
+    "EM_power", "MATERIAL_PARAMS", "MEDIA", "run_optical_response",
 ]
 
 import numpy as np
@@ -745,3 +745,238 @@ def asym(M):
         Parte antisimétrica de la matriz M
     """
     return 1/(2j) * (M - np.conj(M.T))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# High-level workflow: build objects, solve BCM, compute power spectra
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Material and media databases used by run_optical_response
+MATERIAL_PARAMS = {
+    'Silver':  {'EF': 5.53, 'wp': 9.07, 'vf': 1.39e6, 'gamma0': 0.060, 'eps_b': 4.18},
+    'Gold':    {'EF': 5.53, 'wp': 9.03, 'vf': 1.40e6, 'gamma0': 0.070, 'eps_b': 9.84},
+    'Copper':  {'EF': 7.0,  'wp': 8.8,  'vf': 1.57e6, 'gamma0': 0.027, 'eps_b': 1.0},
+}
+
+MEDIA = {
+    'Vacuum / Air': 1.0,
+    'Water':        1.77,
+    'Glass (SiO₂)': 2.25,
+    'TiO₂':         6.25,
+}
+
+
+def _make_eps_drude(mat_name, D, model, material_params, _cache={}):
+    """Build a callable eps(lam_um) for a nanoparticle, with caching."""
+    from scipy.constants import hbar, eV, speed_of_light
+    import plytrons.quantum_well as qw
+    from plytrons.drude_model import (
+        Sij as compute_Sij, eps_PWA,
+        eps_drude_nano_nordlander, eps_drude_bulk,
+    )
+    c0 = speed_of_light
+
+    key = (mat_name, D, model)
+    if key in _cache:
+        return _cache[key]
+
+    p = material_params[mat_name]
+
+    if model == 'PWA':
+        E_mat = qw.get_bound_states(D / 2)
+        A_mat = qw.get_normalization(D / 2, E_mat)
+        e_st  = qw.e_state_assembly(E_mat, A_mat)
+        wij_i, Sij_i, _ = compute_Sij(D / 2, p['EF'], e_st)
+        mask  = np.isfinite(wij_i) & np.isfinite(Sij_i) & (wij_i > 0) & (Sij_i > 0)
+        wij_i = wij_i[mask]; Sij_i = Sij_i[mask]
+
+        def eps(x, _wij=wij_i, _Sij=Sij_i, _wp=p['wp'], _eb=p['eps_b'], _gam=p['gamma0']):
+            E_eV = (hbar / eV) * (2 * np.pi * c0 / (x * 1e-6))
+            with np.errstate(divide='ignore', invalid='ignore'):
+                val = eps_PWA(_wij, _Sij, E_eV, wp_eV=_wp, eps_b=_eb, gamma_eV=_gam, show_progress=False)
+            if not np.isfinite(val):
+                val = _eb - _wp**2 / (E_eV * (E_eV + 1j * _gam))
+            return val
+
+    elif model == 'Nordlander':
+        def eps(x, _D=D, _wp=p['wp'], _eb=p['eps_b'], _gam=p['gamma0'], _vf=p['vf']):
+            E_eV = (hbar / eV) * (2 * np.pi * c0 / (x * 1e-6))
+            return eps_drude_nano_nordlander(E_eV, D_nm=_D, wp_eV=_wp, eps_b=_eb, gamma0=_gam, vf=_vf)
+
+    elif model == 'Bulk':
+        def eps(x, _wp=p['wp'], _eb=p['eps_b'], _gam=p['gamma0']):
+            E_eV = (hbar / eV) * (2 * np.pi * c0 / (x * 1e-6))
+            return eps_drude_bulk(E_eV, wp_eV=_wp, eps_b=_eb, gamma0=_gam)
+
+    else:
+        raise ValueError(f"Unknown model: {model!r}. Choose 'PWA', 'Nordlander', or 'Bulk'.")
+
+    _cache[key] = eps
+    return eps
+
+
+def run_optical_response(config, *, lmax=10, n_points=500, pad_low=0.2, pad_high=0.2):
+    """
+    Run the full BCM optical-response workflow from a builder config dict.
+
+    Parameters"""
+    import warnings
+    warnings.filterwarnings("ignore", category=nb.NumbaPerformanceWarning)
+    warnings.filterwarnings("ignore", category=nb.NumbaWarning)
+    warnings.filterwarnings("ignore", message=".*NumbaTypeSafetyWarning.*")
+    warnings.filterwarnings("ignore", message=".*Cannot cache.*")
+    """
+    ----------
+    config : dict
+        Must contain keys: 'positions', 'diameters', 'materials',
+        'k_vec', 'e_vec', 'eps_h', 'model'.
+    lmax : int
+        Maximum multipole order.
+    n_points : int
+        Number of frequency points.
+    pad_low, pad_high : float
+        Fractional padding around the auto-detected resonance range.
+
+    Returns
+    -------
+    dict with keys:
+        BCM_objects, efield, w, lam_um, E_eV, eps_h, I0, Z0,
+        Psca, Pabs, Qsca_total, Qabs_total, Qext_total,
+        peak_idx_total, peak_idx_per_particle, outdir
+    """
+    from scipy.constants import hbar, eV, speed_of_light, physical_constants
+    from scipy.signal import find_peaks
+    from tqdm.auto import tqdm, trange
+    from plytrons.plot_utils import make_results_folder
+
+    c0 = speed_of_light
+    Z0_val, *_ = physical_constants["characteristic impedance of vacuum"]
+    Z0_val = Z0_val * eV
+
+    # ── Medium ──
+    eps_h = MEDIA[config['eps_h']]
+    print(f"Surrounding medium: {config['eps_h']}  (εₕ = {eps_h})")
+
+    # ── Auto frequency range ──
+    resonances = []
+    for mat in config['materials']:
+        p = MATERIAL_PARAMS[mat]
+        w_res = p['wp'] / np.sqrt(p['eps_b'] + 1 + 2 * eps_h)
+        resonances.append(w_res)
+    w_min = min(resonances) * (1 - pad_low)
+    w_max = max(resonances) * (1 + pad_high)
+    print(f"Auto energy range: {w_min:.2f} – {w_max:.2f} eV")
+    for mat, r in zip(config['materials'], resonances):
+        print(f"  {mat}: resonance ≈ {r:.2f} eV")
+    w = np.linspace(w_min, w_max, n_points) * eV / hbar
+
+    # ── E-field ──
+    efield = EField(
+        E0=1,
+        k_hat=v_normalize(config['k_vec']),
+        e_hat=v_normalize(config['e_vec']),
+    )
+
+    # ── Dielectric model ──
+    drude_model = config['model']
+    print(f"Dielectric model: {drude_model}")
+
+    # ── BCM objects ──
+    BCM_objects = [
+        BCMObject(
+            label=f'Sphere{i}_{mat}',
+            diameter=D, lmax=lmax,
+            eps=_make_eps_drude(mat, D, model=drude_model, material_params=MATERIAL_PARAMS),
+            position=np.array(pos),
+        )
+        for i, (pos, D, mat) in enumerate(
+            zip(config['positions'], config['diameters'], config['materials']), start=1
+        )
+    ]
+
+    Np = len(BCM_objects)
+
+    # ── Interaction matrices ──
+    Gi = [None] * Np
+    G0 = [[None] * Np for _ in range(Np)]
+    Sv = [None] * Np
+    for in_idx in trange(Np, desc="Assembling Gi/G0/Sv", unit="obj"):
+        Gi[in_idx] = Ginternal(BCM_objects[in_idx])
+        for jn_idx in range(Np):
+            G0[in_idx][jn_idx] = Gexternal(BCM_objects[in_idx], BCM_objects[jn_idx])
+        Sv[in_idx] = Efield_coupling(BCM_objects[in_idx], efield)
+
+    # ── Frequency sweep ──
+    dx_max   = lmax * (lmax + 1) + (lmax + 1) - 1
+    obj_coef = [np.zeros((dx_max, len(w)), dtype=complex) for _ in range(Np)]
+    Sw       = [None] * Np
+
+    pbar = tqdm(range(len(w)), desc="Solving BCM over ω", unit="pt")
+    for il in pbar:
+        wi = w[il]
+        pbar.set_postfix_str(f"E={wi*hbar/eV:.2f} eV")
+        try:
+            c, Si = solve_BCM(wi, eps_h, BCM_objects, efield, Gi, G0, Sv)
+            if all(np.all(np.isfinite(ci)) for ci in c):
+                for in_idx in range(Np):
+                    obj_coef[in_idx][:, il] = c[in_idx]
+                    if il == 0:
+                        Sw[in_idx] = np.zeros((len(Si[in_idx]), len(w)), dtype=complex)
+                    Sw[in_idx][:, il] = Si[in_idx]
+        except Exception:
+            pass
+
+    lam_um = 2 * np.pi * 3e14 / w
+    for idx_obj in range(Np):
+        BCM_objects[idx_obj].set_coefficients(lam_um, obj_coef[idx_obj])
+
+    # ── Power spectra ──
+    Psca, Pabs = EM_power(w, eps_h, Gi, G0, BCM_objects)
+    Pabs = [np.where(np.isfinite(p), p, 0.0) for p in Pabs]
+    Psca = [np.where(np.isfinite(p), p, 0.0) for p in Psca]
+
+    I0    = efield.E0**2 / (2 * Z0_val)
+    R_ref = BCM_objects[0].diameter / 2.0
+    A_ref = np.pi * R_ref**2
+
+    Qabs_total = np.array(Pabs).sum(axis=0) / (I0 * A_ref)
+    Qsca_total = np.array(Psca).sum(axis=0) / (I0 * A_ref)
+    Qext_total = Qabs_total + Qsca_total
+
+    # ── Peak detection ──
+    _thr = 0.05 * np.nanmax(np.abs(Qabs_total))
+    peak_idx_total, _ = find_peaks(Qabs_total, prominence=_thr)
+    print(f"Absorption peaks: {len(peak_idx_total)}  at λ = "
+          + ", ".join(f"{lam_um[i]*1e3:.1f} nm" for i in peak_idx_total))
+
+    peak_idx_per_particle = []
+    for i, obj in enumerate(BCM_objects):
+        Qabs_i = Pabs[i] / (I0 * np.pi * (obj.diameter / 2.0)**2)
+        thr_i = 0.05 * np.nanmax(np.abs(Qabs_i))
+        pidx, _ = find_peaks(Qabs_i, prominence=thr_i)
+        peak_idx_per_particle.append(pidx)
+
+    # ── Output folder ──
+    outdir = make_results_folder(BCM_objects, efield)
+    print("Saving to:", outdir)
+
+    E_eV = w * hbar / eV
+
+    return {
+        'BCM_objects': BCM_objects,
+        'efield': efield,
+        'w': w,
+        'lam_um': lam_um,
+        'E_eV': E_eV,
+        'eps_h': eps_h,
+        'I0': I0,
+        'Z0': Z0_val,
+        'Psca': Psca,
+        'Pabs': Pabs,
+        'Qsca_total': Qsca_total,
+        'Qabs_total': Qabs_total,
+        'Qext_total': Qext_total,
+        'peak_idx_total': peak_idx_total,
+        'peak_idx_per_particle': peak_idx_per_particle,
+        'outdir': outdir,
+    }

@@ -1505,5 +1505,552 @@ def absorption_gap_gif(
         pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Optical-response dashboard
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def label_peaks(ax, x, y, n_peaks=3, prominence_frac=0.05, color='steelblue', fontsize=8):
+    """Annotate the top peaks on an axes with vertical lines and energy labels."""
+    from scipy.signal import find_peaks
+    threshold = prominence_frac * np.nanmax(np.abs(y))
+    peaks, props = find_peaks(y, prominence=threshold)
+    if len(peaks) == 0:
+        return
+    top = np.sort(peaks[np.argsort(props['prominences'])[::-1][:n_peaks]])
+    y_span = np.nanmax(y) - np.nanmin(y)
+    ax.set_ylim(top=np.nanmax(y) + 0.28 * y_span)
+    for p in top:
+        xp, yp = x[p], y[p]
+        ax.axvline(xp, ls=':', color=color, lw=1.5, alpha=0.7)
+        ax.text(xp, yp + 0.05 * y_span, f'{xp:.3f} eV',
+                ha='center', va='bottom', fontsize=fontsize, color=color)
+
+
+def plot_optical_dashboard(results, *, config=None, show=True):
+    """
+    Plot and save the optical-response dashboard from run_optical_response output.
+
+    Parameters
+    ----------
+    results : dict
+        Output of ``bcm.run_optical_response(config)``.
+    config : dict, optional
+        Builder config (for cluster description in title).
+        If None, a generic title is used.
+    show : bool
+        Whether to call plt.show().
+
+    Returns
+    -------
+    None  (saves dashboard + individual spectra + geometry.txt to results['outdir'])
+    """
+    import math, textwrap
+    from collections import Counter
+    from pathlib import Path
+
+    BCM_objects = results['BCM_objects']
+    efield      = results['efield']
+    E_eV        = results['E_eV']
+    Pabs        = results['Pabs']
+    I0          = results['I0']
+    Qsca_total  = results['Qsca_total']
+    Qabs_total  = results['Qabs_total']
+    Qext_total  = results['Qext_total']
+    eps_h       = results['eps_h']
+    outdir      = Path(results['outdir'])
+    Np          = len(BCM_objects)
+
+    # ── Title ──
+    field_tag = f'E = {axis_label(efield.e_hat)},  k = {axis_label(efield.k_hat)}'
+    if config is not None:
+        groups = Counter(zip(config['materials'], config['diameters']))
+        cluster_tag = ',  '.join(
+            f'{"" if n == 1 else f"{n}× "}{mat} D={D:.1f} nm'
+            for (mat, D), n in groups.items()
+        )
+    else:
+        cluster_tag = f'{Np} particles'
+    cluster_lines = textwrap.wrap(cluster_tag, width=55)
+
+    # ── Dashboard ──
+    n_cols = 3
+    n_rows = 1 + math.ceil(Np / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows))
+    axes = np.array(axes).reshape(n_rows, n_cols)
+
+    suptitle_text = 'Optical Response\n' + field_tag + '\n' + '\n'.join(cluster_lines)
+    fig.suptitle(suptitle_text, fontsize=12, fontweight='bold', linespacing=1.6)
+
+    # Row 0: totals
+    for ax, data, color, title, ylabel in [
+        (axes[0, 0], Qsca_total, 'C0', 'Total Scattering Efficiency', r'$Q_{sca}$'),
+        (axes[0, 1], Qabs_total, 'k',  'Total Absorption Efficiency', r'$Q_{abs}$'),
+        (axes[0, 2], Qext_total, 'C3', 'Total Extinction Efficiency', r'$Q_{ext}$'),
+    ]:
+        ax.plot(E_eV, data, color=color, lw=2)
+        label_peaks(ax, E_eV, data, color=color if color != 'k' else 'dimgray')
+        ax.set_title(title)
+        ax.set_xlabel('Photon energy (eV)'); ax.set_ylabel(ylabel); ax.grid(True, ls=':')
+
+    # Rows 1+: per-sphere absorption
+    for i, obj in enumerate(BCM_objects, start=1):
+        row = 1 + (i - 1) // n_cols
+        col = (i - 1) % n_cols
+        ax = axes[row, col]
+        Qabs_i = Pabs[i-1] / (I0 * np.pi * (obj.diameter / 2.0)**2)
+        ax.plot(E_eV, Qabs_i, 'C1', lw=2)
+        label_peaks(ax, E_eV, Qabs_i, color='C1')
+        ax.set_title(
+            f'{obj.label}  |  D = {obj.diameter:.1f} nm\n'
+            f'pos = ({obj.position[0]:.1f}, {obj.position[1]:.1f}, {obj.position[2]:.1f}) nm'
+        )
+        ax.set_xlabel('Photon energy (eV)'); ax.set_ylabel(r'$Q_{abs}$'); ax.grid(True, ls=':')
+
+    for r in range(1, n_rows):
+        for c in range(n_cols):
+            if (r - 1) * n_cols + c >= Np:
+                axes[r, c].set_visible(False)
+
+    n_title_lines = 2 + len(cluster_lines)
+    top_frac = max(0.78, 1.0 - 0.045 * n_title_lines)
+    fig.tight_layout(rect=[0, 0, 1, top_frac])
+    fig.savefig(outdir / "optical_response.png", dpi=200, bbox_inches='tight', transparent=True)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    # ── Individual spectrum files ──
+    for i, obj in enumerate(BCM_objects, start=1):
+        fig_i, ax_i = plt.subplots(figsize=(6, 4))
+        Qabs_i = Pabs[i-1] / (I0 * np.pi * (obj.diameter / 2.0)**2)
+        ax_i.plot(E_eV, Qabs_i, 'C1')
+        label_peaks(ax_i, E_eV, Qabs_i, color='C1')
+        ax_i.set_xlabel('Photon energy (eV)'); ax_i.set_ylabel(r'$Q_{abs}$'); ax_i.grid(True, ls=':')
+        fig_i.tight_layout()
+        fig_i.savefig(outdir / f"absorption_spectrum_sphere{i}.png", dpi=200, transparent=True)
+        plt.close(fig_i)
+
+    for fname, data, color in [
+        ("scattering_spectrum_total.png", Qsca_total, 'C0'),
+        ("absorption_spectrum_total.png", Qabs_total, 'k'),
+        ("extinction_spectrum_total.png", Qext_total, 'C3'),
+    ]:
+        fig_i, ax_i = plt.subplots(figsize=(6, 4))
+        ax_i.plot(E_eV, data, color=color)
+        label_peaks(ax_i, E_eV, data, color=color if color != 'k' else 'dimgray')
+        ax_i.set_xlabel('Photon energy (eV)'); ax_i.grid(True, ls=':')
+        fig_i.tight_layout()
+        fig_i.savefig(outdir / fname, dpi=200, transparent=True)
+        plt.close(fig_i)
+
+    # ── Geometry summary ──
+    with open(outdir / "geometry.txt", "w") as f:
+        f.write(f"N particles: {Np}\n")
+        for i, obj in enumerate(BCM_objects, start=1):
+            f.write(f"sphere{i}: label={obj.label}, D={obj.diameter:.3f} nm, "
+                    f"pos=({obj.position[0]:.3f}, {obj.position[1]:.3f}, {obj.position[2]:.3f}) nm, "
+                    f"lmax={obj.lmax}\n")
+        f.write(f"eps_h={eps_h}\n")
+        f.write(f"E0={efield.E0} V/nm, e_hat={efield.e_hat}, k_hat={efield.k_hat}\n")
+
+    print("All figures and data saved in:", outdir)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# E-field map computation and plotting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import matplotlib as mpl
+from matplotlib.patches import Circle
+from matplotlib.colors import TwoSlopeNorm
+from plytrons.math_utils import eps0, em_sph_harm
+
+
+def _lm_arrays(lmax: int):
+    li, mi = [], []
+    for l in range(1, lmax + 1):
+        for m in range(-l, l + 1):
+            li.append(l); mi.append(m)
+    return np.asarray(li, dtype=np.int64), np.asarray(mi, dtype=np.int64)
+
+
+def _cart2sph(x, y, z):
+    r     = np.sqrt(x*x + y*y + z*z)
+    theta = np.arctan2(np.sqrt(x*x + y*y), z)
+    phi   = np.arctan2(y, x)
+    return r, theta, phi
+
+
+def phi_induced_points(pts_nm, BCM_objects, lam_um):
+    """Exterior induced potential at arbitrary points."""
+    pts_nm = np.asarray(pts_nm, dtype=np.float64)
+    Phi    = np.zeros(len(pts_nm), dtype=np.complex128)
+    for obj in BCM_objects:
+        R      = obj.diameter / 2.0
+        X      = obj.coef_at(lam_um)
+        li, mi = _lm_arrays(obj.lmax)
+        if X.shape[0] != li.size:
+            raise ValueError(f"{obj.label}: coef size mismatch")
+        dx = pts_nm[:,0] - obj.position[0]
+        dy = pts_nm[:,1] - obj.position[1]
+        dz = pts_nm[:,2] - obj.position[2]
+        r, th, ph = _cart2sph(dx, dy, dz)
+        outside = r > R * 1.000001
+        if not np.any(outside): continue
+        r_o, th_o, ph_o = r[outside], th[outside], ph[outside]
+        Y      = em_sph_harm(mi[:,None], li[:,None], th_o[None,:], ph_o[None,:])
+        pref   = R**(li + 2) / eps0 / np.sqrt((2.0*li + 1.0) * R**3)
+        radial = r_o[None,:]**(li[:,None] + 1)
+        Phi[outside] += np.sum((pref * X)[:,None] * (Y / radial), axis=0)
+    return Phi
+
+
+def _efield_plane_grid(plane, origin_nm, span_nm, n):
+    u = np.linspace(-span_nm, span_nm, n)
+    v = np.linspace(-span_nm, span_nm, n)
+    U, V  = np.meshgrid(u, v, indexing="xy")
+    ox, oy, oz = origin_nm
+    if plane == "yz":
+        Xg = np.full_like(U, ox); Yg = U + oy; Zg = V + oz
+        lab1, lab2 = "y (nm)", "z (nm)"
+    elif plane == "xz":
+        Xg = U + ox; Yg = np.full_like(U, oy); Zg = V + oz
+        lab1, lab2 = "x (nm)", "z (nm)"
+    elif plane == "xy":
+        Xg = U + ox; Yg = V + oy; Zg = np.full_like(U, oz)
+        lab1, lab2 = "x (nm)", "y (nm)"
+    else:
+        raise ValueError("plane must be 'yz', 'xz', or 'xy'")
+    pts = np.stack([Xg.ravel(), Yg.ravel(), Zg.ravel()], axis=1)
+    return U, V, pts, u[1]-u[0], v[1]-v[0], lab1, lab2, (Xg, Yg, Zg)
+
+
+def host_mask_from_xyz(Xg, Yg, Zg, BCM_objects, shell_nm=0.0):
+    mask = np.ones_like(Xg, dtype=bool)
+    for obj in BCM_objects:
+        R  = obj.diameter / 2.0
+        dx = Xg - obj.position[0]; dy = Yg - obj.position[1]; dz = Zg - obj.position[2]
+        mask &= (np.sqrt(dx*dx + dy*dy + dz*dz) > R + shell_nm)
+    return mask
+
+
+def _host_gradient_2d(Phi, mask, du, dv):
+    Pp_u = np.roll(Phi, -1, axis=1); Pm_u = np.roll(Phi, 1, axis=1)
+    Pp_v = np.roll(Phi, -1, axis=0); Pm_v = np.roll(Phi, 1, axis=0)
+    mp_u = np.roll(mask, -1, axis=1); mm_u = np.roll(mask, 1, axis=1)
+    mp_v = np.roll(mask, -1, axis=0); mm_v = np.roll(mask, 1, axis=0)
+    dPhi_du = (Pp_u - Pm_u) / (2*du)
+    dPhi_dv = (Pp_v - Pm_v) / (2*dv)
+    dPhi_du = np.where(mp_u & ~mm_u, (Pp_u - Phi) / du, dPhi_du)
+    dPhi_du = np.where(mm_u & ~mp_u, (Phi - Pm_u) / du, dPhi_du)
+    dPhi_dv = np.where(mp_v & ~mm_v, (Pp_v - Phi) / dv, dPhi_dv)
+    dPhi_dv = np.where(mm_v & ~mp_v, (Phi - Pm_v) / dv, dPhi_dv)
+    dPhi_du[:, 0] = 0;  dPhi_du[:, -1] = 0
+    dPhi_dv[0, :] = 0;  dPhi_dv[-1, :]  = 0
+    nan = np.nan + 0j
+    return np.where(mask, dPhi_du, nan), np.where(mask, dPhi_dv, nan)
+
+
+_EFIELD_PLANE_NORMAL = {
+    "yz": np.array([1., 0., 0.]),
+    "xz": np.array([0., 1., 0.]),
+    "xy": np.array([0., 0., 1.]),
+}
+
+
+def compute_E2_maps_host_only(
+    *, BCM_objects, efield, lam_um,
+    plane="yz", origin_nm=(0., 0., 0.),
+    span_nm=25., n=301, shell_nm=0., delta_nm=None,
+):
+    """Compute |E|² maps in the host medium (exterior to all spheres)."""
+    p = plane.lower(); nv = _EFIELD_PLANE_NORMAL[p]; o = np.asarray(origin_nm, float)
+    U, V, pts, du, dv, lab1, lab2, (Xg, Yg, Zg) = _efield_plane_grid(p, o, span_nm, n)
+    mask = host_mask_from_xyz(Xg, Yg, Zg, BCM_objects, shell_nm)
+    if delta_nm is None: delta_nm = min(du, dv)
+
+    Phi_0 = phi_induced_points(pts, BCM_objects, lam_um).reshape(n, n)
+    _, _, pts_p, *_ = _efield_plane_grid(p, o + delta_nm*nv, span_nm, n)
+    _, _, pts_m, *_ = _efield_plane_grid(p, o - delta_nm*nv, span_nm, n)
+    Phi_p = phi_induced_points(pts_p, BCM_objects, lam_um).reshape(n, n)
+    Phi_m = phi_induced_points(pts_m, BCM_objects, lam_um).reshape(n, n)
+
+    dPhi_du, dPhi_dv = _host_gradient_2d(Phi_0, mask, du, dv)
+    dPhi_dn = np.where(mask, (Phi_p - Phi_m) / (2*delta_nm), np.nan + 0j)
+
+    Ex = np.zeros((n, n), dtype=np.complex128)
+    Ey = np.zeros((n, n), dtype=np.complex128)
+    Ez = np.zeros((n, n), dtype=np.complex128)
+    if p == "yz":    Ey = -dPhi_du; Ez = -dPhi_dv; Ex = -dPhi_dn
+    elif p == "xz":  Ex = -dPhi_du; Ez = -dPhi_dv; Ey = -dPhi_dn
+    elif p == "xy":  Ex = -dPhi_du; Ey = -dPhi_dv; Ez = -dPhi_dn
+
+    E0v = efield.E0 * np.asarray(efield.e_hat, float)
+    Ex += E0v[0]; Ey += E0v[1]; Ez += E0v[2]
+
+    E2      = np.where(mask, (np.abs(Ex)**2 + np.abs(Ey)**2 + np.abs(Ez)**2).real, np.nan)
+    E2_over = E2 / float(efield.E0**2)
+    return U, V, E2, E2_over, (lab1, lab2)
+
+
+def _make_sphere_img(n=200, base_rgb=(0.70, 0.70, 0.73)):
+    """RGBA image of a Phong-shaded metallic sphere."""
+    t    = np.linspace(-1, 1, n)
+    X, Y = np.meshgrid(t, t)
+    r2   = X**2 + Y**2;  ins = r2 < 1.0
+    with np.errstate(invalid='ignore'):
+        Z = np.sqrt(np.maximum(0.0, 1.0 - r2))
+    lx, ly, lz = -0.40, 0.60, 0.69
+    dot  = np.clip(lx*X + ly*Y + lz*Z, 0.0, 1.0)
+    spec = np.where(ins, np.clip(2.0*dot*Z - lz, 0.0, 1.0)**14, 0.0)
+    b    = np.clip(0.22 + 0.58*dot + 0.48*spec, 0.0, 1.0)
+    img  = np.zeros((n, n, 4), dtype=np.float32)
+    for c, bc in enumerate(base_rgb):
+        img[:, :, c] = bc * b
+    img[:, :, 3] = ins.astype(np.float32)
+    return img
+
+_SPHERE_IMG = _make_sphere_img()
+
+
+def _draw_sphere_circles(ax, BCM_objects, plane, origin_nm=(0., 0., 0.)):
+    p = plane.lower(); ox, oy, oz = origin_nm
+    for obj in BCM_objects:
+        R   = obj.diameter / 2.0;  pos = obj.position
+        if   p == "yz":  cut_dist, cx, cy = pos[0]-ox, pos[1], pos[2]
+        elif p == "xz":  cut_dist, cx, cy = pos[1]-oy, pos[0], pos[2]
+        elif p == "xy":  cut_dist, cx, cy = pos[2]-oz, pos[0], pos[1]
+        else: continue
+        if abs(cut_dist) >= R: continue
+        r_app = np.sqrt(R**2 - cut_dist**2)
+        ax.imshow(_SPHERE_IMG,
+                  extent=[cx-r_app, cx+r_app, cy-r_app, cy+r_app],
+                  origin='lower', aspect='auto', zorder=10, interpolation='bilinear')
+        ax.add_patch(Circle((cx, cy), r_app, fc='none', ec='#303030', lw=0.9, zorder=11))
+
+
+def plot_two_maps(U, V, E2, E2o, lam_um, labels, title_prefix="",
+                  BCM_objects=None, plane=None, origin_nm=(0., 0., 0.)):
+    """Plot exterior |E|² and |E|²/|E0|² maps side by side."""
+    lab1, lab2 = labels
+    cmap = mpl.colormaps["RdBu_r"].copy()
+    cmap.set_bad(alpha=0.0)
+
+    for data, title, cblabel in [
+        (E2,  rf"$|E|^2$ at $\lambda$={lam_um*1e3:.1f} nm",         r"$|E|^2$ (V/nm)²"),
+        (E2o, rf"$|E|^2/|E_0|^2$ at $\lambda$={lam_um*1e3:.1f} nm", r"$|E|^2/|E_0|^2$"),
+    ]:
+        vmin = np.nanpercentile(data, 0.5)
+        vmax = np.nanpercentile(data, 99.5)
+        vmin = min(vmin, 0.999)
+        vmax = max(vmax, 1.001)
+        norm = TwoSlopeNorm(vcenter=1.0, vmin=vmin, vmax=vmax)
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.set_facecolor('#383838')
+        pcm = ax.pcolormesh(U, V, data, shading="auto", cmap=cmap, norm=norm, zorder=1)
+
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        if BCM_objects is not None and plane is not None:
+            _draw_sphere_circles(ax, BCM_objects, plane, origin_nm)
+        ax.set_xlim(xlim); ax.set_ylim(ylim)
+
+        ax.set_xlabel(lab1); ax.set_ylabel(lab2)
+        ax.set_title(title_prefix + title)
+        fig.colorbar(pcm, ax=ax, label=cblabel)
+        ax.set_aspect("equal", "box")
+        fig.tight_layout()
+        plt.show()
+
+
+def phi_all_points(pts_nm, BCM_objects, lam_um):
+    """Induced potential at arbitrary points (interior + exterior)."""
+    pts = np.asarray(pts_nm, float)
+    Phi = np.zeros(len(pts), dtype=np.complex128)
+
+    owner = -np.ones(len(pts), dtype=int)
+    for j, obj in enumerate(BCM_objects):
+        R  = obj.diameter / 2.0
+        dx = pts[:,0] - obj.position[0]
+        dy = pts[:,1] - obj.position[1]
+        dz = pts[:,2] - obj.position[2]
+        owner[np.sqrt(dx*dx + dy*dy + dz*dz) < R * 0.999999] = j
+
+    for j, obj in enumerate(BCM_objects):
+        R      = obj.diameter / 2.0
+        X      = obj.coef_at(lam_um)
+        li, mi = _lm_arrays(obj.lmax)
+
+        dx = pts[:,0] - obj.position[0]
+        dy = pts[:,1] - obj.position[1]
+        dz = pts[:,2] - obj.position[2]
+        r, th, ph = _cart2sph(dx, dy, dz)
+
+        ins = (owner == j)
+        if np.any(ins):
+            r_in = np.maximum(r[ins], 1e-30)
+            Y    = em_sph_harm(mi[:,None], li[:,None],
+                               th[ins][None,:], ph[ins][None,:])
+            rho  = r_in[None,:] / R
+            pref = 1.0 / (eps0 * np.sqrt((2.0*li+1.0) * R))
+            Phi[ins] += np.sum((pref * X)[:,None] * Y * rho**li[:,None], axis=0)
+
+        out = ~ins & (r > R * 1.000001)
+        if np.any(out):
+            r_out = r[out]
+            Y     = em_sph_harm(mi[:,None], li[:,None],
+                                th[out][None,:], ph[out][None,:])
+            pref  = R**(li+2) / eps0 / np.sqrt((2.0*li+1.0) * R**3)
+            Phi[out] += np.sum((pref * X)[:,None] * Y / r_out[None,:]**(li[:,None]+1), axis=0)
+
+    return Phi
+
+
+def compute_E2_maps_interior(
+    *, BCM_objects, efield, lam_um,
+    plane="yz", origin_nm=(0., 0., 0.),
+    span_nm=25., n=301, delta_nm=None,
+):
+    """Compute |E|² maps inside the metal spheres."""
+    p = plane.lower(); nv = _EFIELD_PLANE_NORMAL[p]; o = np.asarray(origin_nm, float)
+    U, V, pts, du, dv, lab1, lab2, (Xg, Yg, Zg) = _efield_plane_grid(p, o, span_nm, n)
+
+    metal_mask = ~host_mask_from_xyz(Xg, Yg, Zg, BCM_objects, shell_nm=0.0)
+
+    if delta_nm is None:
+        delta_nm = min(du, dv)
+
+    Phi_0 = phi_all_points(pts, BCM_objects, lam_um).reshape(n, n)
+    _, _, pts_p, *_ = _efield_plane_grid(p, o + delta_nm*nv, span_nm, n)
+    _, _, pts_m, *_ = _efield_plane_grid(p, o - delta_nm*nv, span_nm, n)
+    Phi_p = phi_all_points(pts_p, BCM_objects, lam_um).reshape(n, n)
+    Phi_m = phi_all_points(pts_m, BCM_objects, lam_um).reshape(n, n)
+
+    dPhi_du, dPhi_dv = _host_gradient_2d(Phi_0, metal_mask, du, dv)
+    dPhi_dn = np.where(metal_mask, (Phi_p - Phi_m) / (2*delta_nm), np.nan + 0j)
+
+    Ex = np.zeros((n, n), dtype=np.complex128)
+    Ey = np.zeros((n, n), dtype=np.complex128)
+    Ez = np.zeros((n, n), dtype=np.complex128)
+    if p == "yz":    Ey = -dPhi_du; Ez = -dPhi_dv; Ex = -dPhi_dn
+    elif p == "xz":  Ex = -dPhi_du; Ez = -dPhi_dv; Ey = -dPhi_dn
+    elif p == "xy":  Ex = -dPhi_du; Ey = -dPhi_dv; Ez = -dPhi_dn
+
+    E0v = efield.E0 * np.asarray(efield.e_hat, float)
+    Ex += E0v[0]; Ey += E0v[1]; Ez += E0v[2]
+
+    E2      = np.where(metal_mask, (np.abs(Ex)**2 + np.abs(Ey)**2 + np.abs(Ez)**2).real, np.nan)
+    E2_over = E2 / float(efield.E0**2)
+    return U, V, E2, E2_over, (lab1, lab2)
+
+
+def plot_interior_maps(U, V, E2, E2o, lam_um, labels,
+                       BCM_objects=None, plane=None, origin_nm=(0., 0., 0.)):
+    """Plot interior |E|² maps."""
+    lab1, lab2 = labels
+    cmap = mpl.colormaps["RdBu_r"].copy()
+    cmap.set_bad(alpha=0.0)
+
+    for data, title, cblabel in [
+        (E2,  rf"$|E_{{\mathrm{{int}}}}|^2$ at $\lambda$={lam_um*1e3:.1f} nm",         r"$|E|^2$ (V/nm)²"),
+        (E2o, rf"$|E_{{\mathrm{{int}}}}|^2/|E_0|^2$ at $\lambda$={lam_um*1e3:.1f} nm", r"$|E|^2/|E_0|^2$"),
+    ]:
+        vmin = np.nanpercentile(data, 0.5)
+        vmax = np.nanpercentile(data, 99.5)
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.set_facecolor('white')
+        pcm  = ax.pcolormesh(U, V, data, shading="auto", cmap=cmap,
+                              vmin=vmin, vmax=vmax, zorder=1)
+
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        if BCM_objects is not None and plane is not None:
+            p = plane.lower(); ox, oy, oz = origin_nm
+            for obj in BCM_objects:
+                R = obj.diameter / 2.0; pos = obj.position
+                if   p == "yz":  cut_dist, cx, cy = pos[0]-ox, pos[1], pos[2]
+                elif p == "xz":  cut_dist, cx, cy = pos[1]-oy, pos[0], pos[2]
+                elif p == "xy":  cut_dist, cx, cy = pos[2]-oz, pos[0], pos[1]
+                else: continue
+                if abs(cut_dist) >= R: continue
+                r_app = np.sqrt(R**2 - cut_dist**2)
+                ax.add_patch(Circle((cx, cy), r_app,
+                                    fc='none', ec='#303030', lw=1.0, zorder=10))
+        ax.set_xlim(xlim); ax.set_ylim(ylim)
+
+        ax.set_xlabel(lab1); ax.set_ylabel(lab2)
+        ax.set_title(title)
+        fig.colorbar(pcm, ax=ax, label=cblabel)
+        ax.set_aspect("equal", "box")
+        fig.tight_layout()
+        plt.show()
+
+
+def _best_plane(e_hat, k_hat=None):
+    e = np.asarray(e_hat, float); e /= np.linalg.norm(e)
+    scores = {pl: abs(float(np.dot(nv, e))) for pl, nv in _EFIELD_PLANE_NORMAL.items()}
+    best_score = min(scores.values())
+    candidates = [pl for pl, s in scores.items() if np.isclose(s, best_score, atol=1e-6)]
+    if len(candidates) == 1 or k_hat is None: return candidates[0]
+    k = np.asarray(k_hat, float); k /= np.linalg.norm(k)
+    return min(candidates, key=lambda pl: abs(float(np.dot(_EFIELD_PLANE_NORMAL[pl], k))))
+
+
+def _cluster_span(BCM_objects, margin_nm=3.0):
+    r_max = max(np.linalg.norm(obj.position) + obj.diameter / 2.0
+                for obj in BCM_objects)
+    return r_max + margin_nm
+
+
+def plot_efield_maps(results, *, plane=None, origin_nm=(0, 0, 0),
+                     margin_nm=4.0, n=101, show=True):
+    """
+    Compute and plot exterior + interior E-field maps at each absorption peak.
+
+    Parameters
+    ----------
+    results : dict
+        Output of ``bcm.run_optical_response(config)``.
+    plane : str or None
+        Cut plane ('yz', 'xz', 'xy'). If None, auto-selected from efield.
+    origin_nm : tuple
+        Origin of the cut plane.
+    margin_nm : float
+        Extra margin beyond the cluster span.
+    n : int
+        Grid resolution per axis.
+    show : bool
+        Whether to call plt.show() (handled inside plot_two_maps / plot_interior_maps).
+    """
+    BCM_objects    = results['BCM_objects']
+    efield         = results['efield']
+    lam_um         = results['lam_um']
+    peak_idx_total = results['peak_idx_total']
+
+    if plane is None:
+        plane = _best_plane(efield.e_hat, efield.k_hat)
+
+    span = _cluster_span(BCM_objects, margin_nm=margin_nm)
+
+    print(f"Using {len(peak_idx_total)} absorption peaks from optical response")
+    print(f"plane = {plane}  |  span = {span:.1f} nm\n")
+
+    for i, idx in enumerate(peak_idx_total):
+        lam0 = float(lam_um[idx])
+        print(f"── Peak {i+1}/{len(peak_idx_total)}: λ = {lam0*1e3:.1f} nm ──")
+
+        U, V, E2, E2o, labels = compute_E2_maps_host_only(
+            BCM_objects=BCM_objects, efield=efield, lam_um=lam0,
+            plane=plane, origin_nm=origin_nm, span_nm=span, n=n,
+        )
+        plot_two_maps(U, V, E2, E2o, lam0, labels,
+                      BCM_objects=BCM_objects, plane=plane, origin_nm=origin_nm)
+
+        U_i, V_i, E2_i, E2o_i, lab_i = compute_E2_maps_interior(
+            BCM_objects=BCM_objects, efield=efield, lam_um=lam0,
+            plane=plane, origin_nm=origin_nm, span_nm=span, n=n,
+        )
+        plot_interior_maps(U_i, V_i, E2_i, E2o_i, lam0, lab_i,
+                           BCM_objects=BCM_objects, plane=plane, origin_nm=origin_nm)
 
 
