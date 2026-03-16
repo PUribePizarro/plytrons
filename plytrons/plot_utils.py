@@ -1017,7 +1017,7 @@ def plot_transition_matrix_colormap(
     dedup: str = "sum",       # 'sum', 'mean', or 'none'
     tol: float = 0.0,         # energy equality tolerance (eV) for dedup
     # ---- NEW SCALING CONTROLS ----
-    scale: str = "asinh",     # 'asinh' (default), 'pow', 'linear', 'log'
+    scale: str = "log",     # 'asinh' (default), 'pow', 'linear', 'log'
     gamma: float = 0.5,       # used when scale='pow' (0.4–0.7 is a nice range)
     tiny: float = 1e-30,      # used when scale='log'
     qmin: float = 0.001,      # percentile clip (0..1)
