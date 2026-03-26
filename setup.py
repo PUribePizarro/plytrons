@@ -7,26 +7,28 @@ setup(
     long_description=(
         'Plytrons is a Python library for modeling plasmon-induced hot carrier '
         'distributions in metallic nanoparticle clusters. It combines the spherical '
-        'quantum well model, Fermi’s golden rule, and plasmon hybridization theory to '
+        'quantum well model, Fermi\'s golden rule, and plasmon hybridization theory to '
         'provide efficient semi-analytical solutions for electromagnetic excitation and '
         'carrier generation.'
     ),
     author='Francisco Ramírez, Pablo Uribe',
-    author_email='fvr@alumni.cmu.edu',  # replace if you'd like
-    url='https://github.com/PanxoPanza/plytrons.git',  # add your repo if applicable
+    author_email='fvr@alumni.cmu.edu',
+    url='https://github.com/PanxoPanza/plytrons.git',
     packages=find_packages(),
     install_requires=[
-        'numpy',
+        'numpy==1.22.4',
+        'scipy==1.7.3',
         'numba',
-        'scipy',
-        'dataclasses',
+        'numba-scipy==0.3.1',
+        'plotly',
+        'ipywidgets',
     ],
     extras_require={
         'dev': ['pytest'],
     },
     classifiers=[
         'Programming Language :: Python :: 3',
-        'License :: OSI Approved :: MIT License',  
+        'License :: OSI Approved :: MIT License',
         'Operating System :: OS Independent',
         'Intended Audience :: Science/Research',
         'Topic :: Scientific/Engineering :: Physics',
