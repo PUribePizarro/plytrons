@@ -1081,26 +1081,22 @@ def plot_transition_matrix_colormap(
         else:
             M_plot, E_plot_u = M_ord, E_ord
 
-    # Robust clipping to avoid extreme outliers
-    vmin = np.quantile(M_plot, qmin)
-    vmax = np.quantile(M_plot, qmax)
-    A = np.clip(M_plot, vmin, vmax)
+    import matplotlib.colors as mcolors
 
-    # Gentle contrast transforms
-    if scale == "log":
-        Z = np.log10(A + tiny); cbl = r"log$_{10}(M_{fi}^2)$"
-    elif scale == "pow":
-        Z = np.power(A / vmax, gamma); cbl = rf"$(M_{{fi}}^2)^\gamma$ (γ={gamma:.2f})"
-    elif scale == "asinh":
-        pos = A[A > 0]
-        s = soft if soft is not None else ((np.percentile(pos, 95)/3.0) if pos.size else 1.0)
-        Z = np.arcsinh(A / s); cbl = r"asinh($M_{fi}^2 / s$)"
-    else:
-        Z = A; cbl = r"$M_{fi}^2$"
+    pos  = M_plot[M_plot > 0]
+    vmax = np.quantile(M_plot, qmax) if pos.size else 1.0
+    lmin = max(np.percentile(pos, 1) if pos.size else tiny, vmax * 1e-3)
+
+    Z    = np.ma.masked_where(M_plot <= 0, np.clip(M_plot, lmin, vmax))
+    norm = mcolors.LogNorm(vmin=lmin, vmax=vmax)
+    cbl  = r"$|M_{fi}|^2$"
 
     edges = _edges_from_centers(E_plot_u)
+    cmap  = plt.get_cmap("hot").copy()
+    cmap.set_bad("black")
     fig, ax = plt.subplots(figsize=(6, 5), constrained_layout=True)
-    mesh = ax.pcolormesh(edges, edges, Z, shading="auto")
+    ax.set_facecolor("black")
+    mesh = ax.pcolormesh(edges, edges, Z, shading="auto", norm=norm, cmap=cmap)
     cb = fig.colorbar(mesh, ax=ax); cb.set_label(cbl)
     ax.set_xlabel(xlabel if not relative_to_EF else xlabel.replace("(eV)", "− E$_F$ (eV)"))
     ax.set_ylabel(ylabel if not relative_to_EF else ylabel.replace("(eV)", "− E$_F$ (eV)"))
@@ -1109,6 +1105,56 @@ def plot_transition_matrix_colormap(
     ax.set_aspect("equal", adjustable="box")
     if savepath: fig.savefig(savepath, dpi=300, bbox_inches="tight")
     plt.show()
+
+def plot_mfi_abs(
+    Mfi2: np.ndarray,
+    E_vals: np.ndarray,
+    *,
+    dE_lines: list[int] = [0, 1, 2, 3, 4, 5, 6, 7, 8],
+    decades: float = 3.0,
+) -> None:
+    """Ei/Ef heatmap of |Mfi| with LogNorm + line plot vs Ef-Ei."""
+    import matplotlib.colors as mcolors
+
+    M = np.sqrt(np.asarray(Mfi2, float))
+    EI, EF_grid = np.meshgrid(E_vals, E_vals)
+
+    pos  = M[M > 0]
+    vmax = np.percentile(pos, 99)
+    lmin = np.percentile(pos, 20)
+    Z    = np.ma.masked_where(M <= 0, np.clip(M, lmin, vmax))
+    norm = mcolors.LogNorm(vmin=lmin, vmax=vmax)
+    cmap = plt.get_cmap("hot").copy()
+    cmap.set_bad("black")
+
+    _colors = plt.cm.tab10(np.linspace(0, 1, len(dE_lines)))
+    x       = (EF_grid - EI).ravel()
+    order   = np.argsort(x)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    axes[0].set_facecolor("black")
+    sc = axes[0].pcolormesh(EI, EF_grid, Z, cmap=cmap, norm=norm)
+    plt.colorbar(sc, ax=axes[0], label='$|M_{fi}|$')
+    for dE, col in zip(dE_lines, _colors):
+        axes[0].plot(E_vals, E_vals + dE, lw=1.2, ls='--', color=col, label=f'$E_f-E_i={dE}$')
+    axes[0].set_xlim(E_vals.min(), E_vals.max())
+    axes[0].set_ylim(E_vals.min(), E_vals.max())
+    axes[0].set_xlabel('$E_i$ (eV)', fontsize=12)
+    axes[0].set_ylabel('$E_f$ (eV)', fontsize=12)
+    axes[0].set_title('$|M_{fi}|$', fontsize=13)
+    axes[0].legend(fontsize=7)
+
+    axes[1].plot(x[order], M.ravel()[order], lw=1.5, color='seagreen')
+    for dE, col in zip(dE_lines, _colors):
+        axes[1].axvline(dE, lw=1.2, ls='--', color=col)
+    axes[1].set_xlabel('$E_f - E_i$ (eV)', fontsize=12)
+    axes[1].set_ylabel('$|M_{fi}|$', fontsize=12)
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
 
 def plot_Ne_cdf_steps(
     eps_axis: np.ndarray,

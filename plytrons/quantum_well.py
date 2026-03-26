@@ -74,7 +74,7 @@ def _bisection_root(f, l, a, E_low, E_high, max_iter, tol):
 
 
 @njit(parallel=True, fastmath=True)
-def _bound_states_ragged(a_nm, lmax=200, V0=10.0,
+def _bound_states_ragged(a_nm, lmax=200, V0=15.0,
                      nE_coarse=2000, max_iter=40, tol=1e-6):
     """
     Adaptive search for bound energies of a infinite spherical quantum well.
