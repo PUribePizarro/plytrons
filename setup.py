@@ -20,11 +20,15 @@ setup(
         'scipy==1.7.3',
         'numba',
         'numba-scipy==0.3.1',
+        'matplotlib',
         'plotly',
         'ipywidgets',
+        'tqdm',
+        'imageio',
     ],
     extras_require={
         'dev': ['pytest'],
+        'docs': ['jupyter', 'notebook'],
     },
     classifiers=[
         'Programming Language :: Python :: 3',

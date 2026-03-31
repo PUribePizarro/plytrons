@@ -1966,13 +1966,18 @@ def compute_E2_maps_interior(
     if delta_nm is None:
         delta_nm = min(du, dv)
 
+    # shrink interior mask by one grid step so in-plane finite differences
+    # never cross the metal-vacuum interface (where dPhi/dn is discontinuous)
+    surface_shell = max(du, dv)
+    grad_mask = ~host_mask_from_xyz(Xg, Yg, Zg, BCM_objects, shell_nm=-surface_shell)
+
     Phi_0 = phi_all_points(pts, BCM_objects, lam_um).reshape(n, n)
     _, _, pts_p, *_ = _efield_plane_grid(p, o + delta_nm*nv, span_nm, n)
     _, _, pts_m, *_ = _efield_plane_grid(p, o - delta_nm*nv, span_nm, n)
     Phi_p = phi_all_points(pts_p, BCM_objects, lam_um).reshape(n, n)
     Phi_m = phi_all_points(pts_m, BCM_objects, lam_um).reshape(n, n)
 
-    dPhi_du, dPhi_dv = _host_gradient_2d(Phi_0, metal_mask, du, dv)
+    dPhi_du, dPhi_dv = _host_gradient_2d(Phi_0, grad_mask, du, dv)
     dPhi_dn = np.where(metal_mask, (Phi_p - Phi_m) / (2*delta_nm), np.nan + 0j)
 
     Ex = np.zeros((n, n), dtype=np.complex128)
