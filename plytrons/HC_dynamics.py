@@ -1,1478 +1,419 @@
-#Hot Carriers Dynamics in Plasmonic Nanoclusters
+# Hot Carriers Dynamics — Geometry & Optical-Excitation Analysis Layer
 #
-# Part A: Optical excitation (Fermi golden rule)
-# Part B: Electron-electron scattering (Saavedra et al. ACS Photonics 2016, eq 14)
-
-
-from typing import List, Tuple
+# Scope: quasi-static NP geometry sweeps and variable-geometry optical analysis.
+# This module is intentionally limited to the BCM / optical-excitation layer:
+#
+#   bcm_sphere.py    ← EM solver  (BCM, X_lm coefficients)
+#   hot_carriers.py  ← optical excitation  (Fermi golden rule, hot_e_dist)
+#        ↑
+#   HC_dynamics.py   ← THIS FILE
+#
+# Relaxation physics (electron-electron, electron-phonon) lives in
+# relaxation.py and is NOT imported here — it is a separate model.
+#
+# Functions
+# ---------
+#   cluster_peak_energies      : group resonance peaks across a parameter sweep
+#   gap_sweep                  : BCM solve across inter-sphere gap values
+#   spatial_asymmetry_index    : per-sphere η_g asymmetry (0 = symmetric)
+#   multipole_weight           : per-ℓ weight Σ_m |X_ℓm|² from BCM coefficients
 
 import numpy as np
-import numba as nb
-from numba import prange
-from numba.typed import List as _NList
 
-# ── Project-specific helpers ───────────────────────────────────────────────
-from plytrons.math_utils import eps0, hbar, nb_meshgrid, me
-from plytrons.wigner3j import Wigner3j, gaunt_coeff
-from plytrons.quantum_well import js_real, ke, QWLevelSet
+# ── Optical excitation core ────────────────────────────────────────────────────
+from plytrons.hot_carriers import hot_e_dist
 
-__all__ = ["hot_e_dist", "ee_scattering_rates", "ee_lifetimes",
-           "electronic_specific_heat", "eph_rate", "eph_lifetime",
-           "effective_lifetime", "hot_e_dist_resolved"]
+# ── plot_utils utilities used here ────────────────────────────────────────────
+from plytrons.plot_utils import (
+    find_dominant_peak,
+    get_preset_geometry,
+)
 
-# =============================================================================
-# 1. Low-level utilities
-# =============================================================================
-
-@nb.njit(cache=True, fastmath=True)
-def _fermi_dirac(E: np.ndarray, E_F: float, T: float = 0.0001) -> np.ndarray:
-    """Vectorised Fermi-Dirac occupation *f(E)* (Numba-accelerated)."""
-    k_B = 8.617333262e-5  # eV K^-1
-    return 1.0 / (np.exp((E - E_F) / (k_B * T)) + 1.0)
-
-@nb.njit(cache=True)
-def idx_to_lm(k: int) -> tuple[int, int]:
-    """
-    Constant-time conversion from array position `k` -> (l, m).
-
-    Parameters
-    ----------
-    k : int
-        Position in the list (Python 0-based by default).
-
-    Returns
-    -------
-    l, m : tuple[int, int]
-    """
-    if k < 0:
-        raise IndexError("index must be >= 0")
-
-    # total items up to and including l is Nl = l(l + 2)
-    # minimal l with Nl > k  =>  l = floor(sqrt(k + 1) - 1) + 1
-    l = np.floor(np.sqrt(k + 1) - 1) + 1
-
-    offset = k - ((l - 1) * (l + 1))   # k minus items in previous blocks
-    m = offset - l                      # map 0...2l  ->  -l...l
-    return l, m
-
-@nb.njit(cache=True)
-def lm_to_idx(l: int, m: int) -> int:
-    """
-    Constant-time conversion from (l, m) -> array position k (0-based).
-
-    Parameters
-    ----------
-    l : int
-        Degree, must be >= 1.
-    m : int
-        Order, must satisfy -l <= m <= l.
-
-    Returns
-    -------
-    k : int
-        Position in the flattened (l,m) list (0-based).
-    """
-    if l < 1:
-        raise IndexError("l must be >= 1")
-    if m < -l or m > l:
-        raise IndexError("m must satisfy -l <= m <= l")
-
-    k = (l - 1) * (l + 1) + (m + l)
-    return k
+__all__ = [
+    # Optical excitation (re-exported for caller convenience)
+    "hot_e_dist",
+    # Resonance tracking
+    "cluster_peak_energies",
+    "PEAK_ENERGY_TOL_eV",
+    # Gap-sweep driver
+    "MIN_GAP_TO_RADIUS_RATIO",
+    "gap_sweep",
+    # Cluster analysis
+    "spatial_asymmetry_index",
+    "multipole_weight",
+]
 
 
 # #############################################################################
 #
-#  PART A  –  OPTICAL EXCITATION  (Fermi golden rule)
+#  PART E  –  SIMULATION VISUALIZATION UTILITIES
+#
+#  Functions for tracking resonances across parameter sweeps and generating
+#  publication-quality GIFs combining absorption spectra and hot-carrier
+#  distributions.
 #
 # #############################################################################
 
-# -----------------------------------------------------------------------------
-# 2. Single-multipole transition matrix M_fi  (serial inside)
-# -----------------------------------------------------------------------------
+# ── Energy tolerance for resonance clustering ──────────────────────────────
+PEAK_ENERGY_TOL_eV = 0.08
 
-@nb.njit(fastmath=True, parallel = False)
-def _M_transition_squared(
-    lf: int,
-    li: int,
-    a_nm: float,
-    X_lm: np.ndarray,     # complex128[:]
-    state_f: QWLevelSet,
-    state_i: QWLevelSet,
-) -> np.ndarray:
-    """Compute *|Mfi|^2* for a given pair of angular momenta lf <- li."""
-
-    # get parameters of final state
-    Ef, Af = state_f.Eb.real.astype(np.float64), state_f.A
-    n_f = Ef.size
-
-    # get parameters of initial state
-    Ei, Ai = state_i.Eb.real.astype(np.float64), state_i.A
-    n_i = Ei.size
-
-    # |Af*Ai|^2 as an outer product -> (n_f, n_i)
-    Af2 = (Af * Af.conj()).real
-    Ai2 = (Ai * Ai.conj()).real
-    AA_abs2 = Af2[:, None] * Ai2[None, :]
-
-    # ----- radial grid & Bessels -------------------------------------------
-    Nr = 128
-    r = np.linspace(0.0, a_nm, Nr)      # (Nr,)
-    rr = r[:, None]                          # (Nr, 1) for broadcasting
-
-    # Bessel columns: A=(Nr,n_f), B=(Nr,n_i)
-    j_lf = js_real(lf, ke(Ef[None, :]) * rr)       # j_lf(k_f r)
-    j_li = js_real(li, ke(Ei[None, :]) * rr)       # j_li(k_i r)
-
-    # trapezoid weights along r (Numba-safe)
-    dr = 0.0 if Nr < 2 else (r[1] - r[0])
-    w  = np.full(Nr, dr, dtype=np.float64)
-    if Nr >= 1:
-        w[0] *= 0.5
-        w[-1] *= 0.5
-
-    # will accumulate the real, positive squared amplitudes
-    Mfi_2 = np.zeros((n_f, n_i), dtype=np.float64)
-
-    # max l present in X_lm
-    le_max = idx_to_lm(X_lm.size - 1)[0]
-
-    for le in range(1, int(le_max) + 1):
-
-        # triangle rule: |lf - li| <= le <= lf + li
-        if le < abs(li - lf) or le > li + lf:
-            continue
-
-        # even-sum rule: lf + le + li must be even
-        if ((lf + le + li) & 1) == 1:
-            continue
-
-       # ---------- Integration along solid angle ---------------------
-        # power in field multipole le: P_le = sum_m |X_{le m}|^2
-        idx0 = lm_to_idx(le, -le)
-        idx1 = lm_to_idx(le,  le) + 1
-        Xl = X_lm[idx0:idx1]
-
-        # Numba-friendly real power sum
-        X_lm_sum = 0.0
-        for x_lm in Xl:
-            X_lm_sum += x_lm.real * x_lm.real + x_lm.imag * x_lm.imag
-
-        if X_lm_sum <= 1e-18:
-            continue
-
-        # angular factor from 3j orthogonality (sum over m_f, m_i)
-        W = Wigner3j(lf, le, li, 0, 0, 0)
-        Mfi_ang2 = ((2.0*lf + 1.0)*(2.0*li + 1.0)*(W*W)*X_lm_sum
-                     / (4.0*np.pi))
-
-        # amplitude prefactor, squared
-        pref = (1.0/eps0) * np.sqrt(le / (a_nm**3)) / (2*le + 1)
-        scale2 = (pref / (a_nm**(le - 1)))**2  # real
-
-        # radial integrals for each Ef row
-        rw = np.empty(Nr, dtype=np.float64)
-        for ii in range(Nr):
-            rw[ii] = w[ii] * (r[ii] ** (le + 2))
-
-        # I = int j_lf(k_f r) j_li(k_i r) r^(le+2) dr -> (n_f, n_i)
-        j_li_w = (rw[:, None]) * j_li                  # (Nr, n_i)
-        I   = j_lf.T @ j_li_w                          # (n_f, n_i)
-
-        # accumulate squared integral
-        Mfi_2 += scale2 * Mfi_ang2 * (I * I)
-
-    # include |Af*Ai|^2
-    return Mfi_2 * AA_abs2
+# ── Gap-geometry safety limit ───────────────────────────────────────────────
+MIN_GAP_TO_RADIUS_RATIO = 0.05   # g_min = MIN_GAP_TO_RADIUS_RATIO * R
 
 
-# =============================================================================
-# 3. Parallel driver with full (l,m) summation  –  OPTICAL EXCITATION
-# =============================================================================
-
-@nb.njit(fastmath=True, parallel=True)
-def _hot_e_dist_parallel(
-    a_nm: float,
-    hv_eV: float,
-    E_F: float,
-    tau_e: np.ndarray,
-    e_state: List[QWLevelSet],
-    X_lm: np.ndarray,
-    Pabs: float
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-
-    # --- flatten bound levels ---------------------------------------------
-    lmax = len(e_state)
-    l_range = np.zeros(lmax + 1, dtype=np.int64)
-    for l in range(lmax):
-        l_range[l + 1] = l_range[l] + e_state[l].Eb.size
-    N = l_range[-1]
-
-    E_all = np.empty(N, dtype=np.float64)
-    for l in range(lmax):
-        E_all[l_range[l]: l_range[l + 1]] = e_state[l].Eb.real
-
-    # global transition matrices
-    Mfi_2_all = np.zeros((N, N), dtype=np.float64)
-
-    # outer parallelism over final l index ----------------------------------
-    for lf in prange(lmax):
-        state_lf = e_state[lf]
-        lf_s, lf_e = l_range[lf], l_range[lf + 1]
-        for li in range(lmax):
-            state_li = e_state[li]
-            li_s, li_e = l_range[li], l_range[li + 1]
-
-            Mfi_2_block = _M_transition_squared(lf, li, a_nm, X_lm, state_lf, state_li)
-
-            Mfi_2_all[lf_s:lf_e, li_s:li_e] = Mfi_2_block
-
-# --- Golden-rule probability matrices ----------------------------------
-    EE_i, EE_f = nb_meshgrid(E_all, E_all)
-    fd_i = _fermi_dirac(EE_i, E_F)
-    fd_f = _fermi_dirac(EE_f, E_F)
-
-    Te = np.zeros((len(tau_e), N), dtype=np.float64)
-    Th = np.zeros((len(tau_e), N), dtype=np.float64)
-    Te_raw_ = np.zeros((len(tau_e), N), dtype=np.float64)
-    Th_raw_ = np.zeros((len(tau_e), N), dtype=np.float64)
-
-
-    for i in range(len(tau_e)):
-
-        tau_dx = tau_e[i]
-
-        gamma_e = hbar / tau_dx  # eV
-
-        denom_e = (hv_eV - EE_f + EE_i)**2 + gamma_e**2
-        denom_h = (hv_eV - EE_i + EE_f)**2 + gamma_e**2
-
-        TTe = 4.0/tau_dx * fd_i * (1.0 - fd_f) * (
-            Mfi_2_all/denom_e
-              + Mfi_2_all.T/denom_h
-            )
-
-        TTh = 4.0/tau_dx * fd_f * (1.0 - fd_i) * (
-            Mfi_2_all/denom_h
-              + Mfi_2_all.T/denom_e
-            )
-
-        Te_raw = TTe.sum(axis=1)
-        Th_raw = TTh.sum(axis=1)
-
-        # --- Normalisation -----------------------------------------------------
-
-        P_diss = 0.0
-        for f in range(N):
-            Ef = E_all[f]
-            for i_ in range(N):
-                dE = Ef - E_all[i_]
-                if dE > 0.0:
-                    P_diss += dE * (TTe[f, i_])
-
-        if P_diss <= 0.0 or not np.isfinite(P_diss):
-            P_diss = 1e-300
-
-        Pabs_fs = Pabs  # eV/fs
-        S = Pabs_fs / P_diss
-
-
-        Vol = 4/3*np.pi*a_nm**3                # Volume of sphere (nm^3)
-
-        Te[i] = S * Te_raw/Vol
-        Th[i] = S * Th_raw/Vol
-        Te_raw_[i] = S * Te_raw
-        Th_raw_[i] = S * Th_raw
-
-    # ---- sort by energy (lowest -> highest) and build a SORTED matrix ------
-    order = np.argsort(E_all)
-    E_sorted = E_all[order]
-
-    Mfi_2_sorted = np.empty_like(Mfi_2_all)
-    for ii in range(N):
-        i_old = order[ii]
-        for jj in range(N):
-            j_old = order[jj]
-            Mfi_2_sorted[ii, jj] = Mfi_2_all[i_old, j_old]
-
-    return Te, Th, Te_raw_, Th_raw_, Mfi_2_sorted, E_sorted, S, Pabs_fs, P_diss
-
-
-# =============================================================================
-# 4. Thin wrapper  –  OPTICAL EXCITATION
-# =============================================================================
-
-def hot_e_dist(
-    a_nm: float,
-    hv_eV: float,
-    E_F: float,
-    tau_e_fs: np.ndarray,
-    e_state,                # plain list OR numba.typed.List
-    X_lm: np.ndarray,
-    Pabs: float
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-
-    """Parallel hot-carrier generation with full (l,m) summation."""
-    if not isinstance(e_state, _NList):
-        tmp = _NList()
-        for s in e_state:
-            tmp.append(s)
-        e_state = tmp
-
-    return _hot_e_dist_parallel(a_nm, hv_eV, E_F, tau_e_fs, e_state, X_lm, Pabs)
-
-
-# #############################################################################
-#
-#  PART B  –  ELECTRON-ELECTRON SCATTERING
-#
-#  Reference: Saavedra, Asenjo-Garcia & Garcia de Abajo,
-#             ACS Photonics 3, 1637 (2016), equations 3 & 14.
-#
-#  Key formula (eq 14, m-summed):
-#
-#    gamma_{j<-i}^{e-e} = (8*pi*k_C * a^5 / hbar) * |A_i|^2 * |A_j|^2
-#        * sum_{l_c} angular_factor(l_j, l_c, l_i)
-#                    * radial_G_l(l_c, beta_j, l_j, beta_i, l_i, eps)
-#                    * [n_T(|omega_ij|) + theta(omega_ij)]
-#
-#  where:
-#    angular_factor = (2*l_j+1)/(4*pi) * W^2(l_j, l_c, l_i, 0, 0, 0)
-#    radial_G_l = -Im{ G_l(omega_ij) }   (screened Coulomb Green's function)
-#    n_T = Bose-Einstein distribution
-#    theta(x) = Heaviside step function
-#    omega_ij = E_i - E_j   (energy transfer, in eV)
-#
-# #############################################################################
-
-# =============================================================================
-# B1. Bose-Einstein distribution
-# =============================================================================
-
-@nb.njit(cache=True, fastmath=True)
-def _bose_einstein(dE_eV: float, T_K: float) -> float:
+def cluster_peak_energies(energies_eV, tol_eV: float = PEAK_ENERGY_TOL_eV):
     """
-    Bose-Einstein distribution n_T(omega) = 1/(exp(omega/kT) - 1).
+    Cluster a list of peak energies (across gap/parameter sweep steps) into
+    resonance groups separated by more than `tol_eV`.
 
     Parameters
     ----------
-    dE_eV : float
-        Energy transfer |omega| in eV. Must be > 0.
-    T_K : float
-        Temperature in Kelvin.
+    energies_eV : array-like
+        All detected peak energies [eV] across all sweep steps.
+    tol_eV : float
+        Minimum separation to consider two energies as distinct resonances.
 
     Returns
     -------
-    n_T : float
+    clusters : list of dict
+        Each dict has:
+          'center_eV'   – mean energy of the cluster [eV]
+          'members_idx' – original indices of energies_eV that belong here
     """
-    k_B = 8.617333262e-5  # eV/K
-    if T_K < 1e-6 or dE_eV < 1e-15:
-        return 0.0
-    arg = dE_eV / (k_B * T_K)
-    if arg > 500.0:
-        return 0.0
-    return 1.0 / (np.exp(arg) - 1.0)
+    E = np.array(energies_eV, float)
+    if E.size == 0:
+        return []
+    order = np.argsort(E)
+    E_sorted = E[order]
+    clusters, start = [], 0
+    for i in range(1, len(E_sorted) + 1):
+        if i == len(E_sorted) or (E_sorted[i] - E_sorted[i - 1]) > tol_eV:
+            members_sorted_idx = np.arange(start, i)
+            members_orig_idx   = order[members_sorted_idx]
+            center = E_sorted[start:i].mean()
+            clusters.append({
+                'center_eV':   float(center),
+                'members_idx': members_orig_idx.tolist(),
+            })
+            start = i
+    return clusters
 
 
-# =============================================================================
-# B2. Drude permittivity (Numba-compatible, complex-valued)
-# =============================================================================
-
-@nb.njit(cache=True, fastmath=True)
-def _eps_drude(omega_eV: float, wp_eV: float, eps_b: float,
-               gamma_eV: float) -> complex:
+def spatial_asymmetry_index(eta_g_per_sphere):
     """
-    Drude dielectric function eps(omega) = eps_b - wp^2 / [omega(omega + i*gamma)].
+    Compute the spatial asymmetry index A of hot-electron generation.
+
+    .. math::
+
+        A = \\frac{\\eta_{g,\\max} - \\eta_{g,\\min}}
+                  {\\eta_{g,\\max} + \\eta_{g,\\min}}
 
     Parameters
     ----------
-    omega_eV : float
-        Photon/transition energy hbar*omega [eV].
-    wp_eV : float
-        Plasma frequency [eV].
-    eps_b : float
-        Background (interband) dielectric constant.
-    gamma_eV : float
-        Damping rate [eV].
+    eta_g_per_sphere : array-like or dict
+        Per-sphere generation efficiencies eta_g.  For a dimer this is a
+        length-2 sequence ``[eta_1, eta_2]``; for an N-sphere cluster,
+        length N.  If a dict is passed (e.g. ``{label: eta_g}``), the
+        values are used in iteration order.
 
     Returns
     -------
-    eps : complex128
+    A : float
+        Asymmetry index in [0, 1]:
+
+        * **A = 0** — perfectly symmetric: all spheres generate equally.
+          Guaranteed for a homodimer under a symmetric illumination
+          direction (e.g. E transverse, k through the gap midpoint).
+        * **A = 1** — fully localised: generation is concentrated on one
+          sphere (eta_g_min -> 0), i.e. one sphere acts as a pure
+          absorber and the other as a near-field antenna.
+        * **Intermediate values** indicate partial hot-spot localisation.
+          In a homodimer swept from large to small gap, A typically rises
+          as the bonding mode concentrates the near field at the gap
+          facets of one sphere.
+
+    Raises
+    ------
+    ValueError
+        If fewer than 2 values are provided, or if eta_g_max + eta_g_min
+        is zero (both efficiencies are identically zero).
+
+    Examples
+    --------
+    >>> A = spatial_asymmetry_index([0.12, 0.08])
+    >>> print(f"A = {A:.3f}")   # 0.200
     """
-    omega = omega_eV + 0.0j
-    return eps_b - (wp_eV**2) / (omega * (omega + 1j * gamma_eV))
-
-
-# =============================================================================
-# B3. Screened Coulomb Green's function G_l  (SAG16 eq 14)
-# =============================================================================
-#
-# The radial part of the e-e Coulomb interaction inside a dielectric sphere
-# involves:
-#
-#   G_l(omega) = (1/eps) * integral_0^1 f_ij(x) * g_l(x) dx
-#              + [(2l+1) / (l*eps + l + 1) - 1/eps] * R_{l+2}
-#
-# where:
-#   f_ij(x) = j_{l_i}(beta_i * x) * j_{l_j}(beta_j * x)
-#   g_l(x)  = x^{1-l} * int_0^x y^{l+2} * f(y) dy
-#            + x^{l+2} * int_x^1 y^{1-l} * f(y) dy
-#   R_{l+2} = int_0^1 x^{l+2} * f(x) dx
-#   beta    = k_e * a  (dimensionless wavevector * radius)
-#
-# =============================================================================
-
-@nb.njit(cache=True, fastmath=True)
-def _Gl_screened(
-    l_c: int,
-    beta_j: float,
-    l_j: int,
-    beta_i: float,
-    l_i: int,
-    eps_val: complex,
-    Nr: int,
-) -> complex:
-    """
-    Screened Coulomb Green's function G_l for a single multipole l_c.
-
-    Parameters
-    ----------
-    l_c : int
-        Coulomb multipole order (>= 1).
-    beta_j, l_j : float, int
-        Dimensionless wavevector and angular momentum of state j.
-    beta_i, l_i : float, int
-        Dimensionless wavevector and angular momentum of state i.
-    eps_val : complex
-        Dielectric function eps(omega_ij).
-    Nr : int
-        Number of radial grid points.
-
-    Returns
-    -------
-    G_l : complex128
-        The screened Green's function for multipole l_c.
-    """
-    # radial grid x in [0, 1] (dimensionless r/a)
-    x = np.linspace(0.0, 1.0, Nr)
-    dx = x[1] - x[0] if Nr > 1 else 1.0
-
-    # f(x) = j_{l_i}(beta_i * x) * j_{l_j}(beta_j * x)
-    f = np.empty(Nr, dtype=np.float64)
-    for ii in range(Nr):
-        f[ii] = js_real(l_i, beta_i * x[ii]) * js_real(l_j, beta_j * x[ii])
-
-    # --- Build g_l(x) via cumulative integrals ---
-    # Term 1: I_up(x) = int_0^x y^{l_c+2} f(y) dy   (cumulative from left)
-    # Term 2: I_dn(x) = int_x^1 y^{1-l_c} f(y) dy   (cumulative from right)
-
-    # Precompute integrands
-    integrand_up = np.empty(Nr, dtype=np.float64)
-    integrand_dn = np.empty(Nr, dtype=np.float64)
-    for ii in range(Nr):
-        xi = x[ii]
-        if xi < 1e-30:
-            integrand_up[ii] = 0.0
-            integrand_dn[ii] = 0.0
-        else:
-            integrand_up[ii] = (xi ** (l_c + 2)) * f[ii]
-            integrand_dn[ii] = (xi ** (1 - l_c)) * f[ii]
-
-    # Cumulative trapezoid from left: I_up[k] = int_0^{x_k} ...
-    I_up = np.zeros(Nr, dtype=np.float64)
-    for ii in range(1, Nr):
-        I_up[ii] = I_up[ii-1] + 0.5 * dx * (integrand_up[ii-1] + integrand_up[ii])
-
-    # Cumulative trapezoid from right: I_dn[k] = int_{x_k}^1 ...
-    I_dn = np.zeros(Nr, dtype=np.float64)
-    for ii in range(Nr - 2, -1, -1):
-        I_dn[ii] = I_dn[ii+1] + 0.5 * dx * (integrand_dn[ii] + integrand_dn[ii+1])
-
-    # g_l(x) = x^{1-l_c} * I_up(x) + x^{l_c+2} * I_dn(x)
-    g = np.empty(Nr, dtype=np.float64)
-    for ii in range(Nr):
-        xi = x[ii]
-        if xi < 1e-30:
-            g[ii] = 0.0
-        else:
-            g[ii] = (xi ** (1 - l_c)) * I_up[ii] + (xi ** (l_c + 2)) * I_dn[ii]
-
-    # --- Main integral: int_0^1 f(x) * g_l(x) dx ---
-    fg_integral = 0.0
-    for ii in range(Nr):
-        w_ii = dx
-        if ii == 0 or ii == Nr - 1:
-            w_ii *= 0.5
-        fg_integral += w_ii * f[ii] * g[ii]
-
-    # --- Boundary integral: R_{l+2} = int_0^1 x^{l_c+2} f(x) dx ---
-    R_integral = I_up[Nr - 1]  # = int_0^1 x^{l_c+2} f(x) dx
-
-    # --- Assemble G_l ---
-    inv_eps = 1.0 / eps_val
-
-    # Boundary correction factor
-    boundary_factor = (2*l_c + 1.0) / (l_c * eps_val + l_c + 1.0) - inv_eps
-
-    G_l = inv_eps * fg_integral + boundary_factor * R_integral
-
-    return G_l
-
-
-# =============================================================================
-# B4. Single e-e scattering rate gamma_{j<-i}  (m-summed)
-# =============================================================================
-
-@nb.njit(cache=True, fastmath=True)
-def _gamma_ee_pair(
-    E_i: float,
-    l_i: int,
-    At2_i: float,      # |Ã_i|^2  (dimensionless, = |A_i|^2 * a^3)
-    E_j: float,
-    l_j: int,
-    At2_j: float,      # |Ã_j|^2  (dimensionless, = |A_j|^2 * a^3)
-    a_nm: float,
-    T_K: float,
-    wp_eV: float,
-    eps_b: float,
-    gamma_eV: float,
-    Nr: int,
-    lc_max: int,
-) -> float:
-    """
-    Compute the e-e scattering rate gamma_{j<-i} (m-summed, in 1/fs).
-
-    Uses dimensionless normalization Ã = A * a^{3/2} to avoid floating-point
-    overflow/underflow from mixing large a^5 with small |A|^2 ~ nm^{-3}.
-
-    The rescaled prefactor is:
-        8*pi*k_C*a^5/hbar * |A_i|^2 * |A_j|^2
-      = 8*pi*k_C/(hbar*a) * |Ã_i|^2 * |Ã_j|^2
-
-    All quantities are O(1) in the dimensionless form.
-
-    Parameters
-    ----------
-    E_i, l_i, At2_i : float, int, float
-        Energy [eV], angular momentum, dimensionless |Ã_i|^2 of initial state.
-    E_j, l_j, At2_j : float, int, float
-        Energy [eV], angular momentum, dimensionless |Ã_j|^2 of final state.
-    a_nm : float
-        Sphere radius [nm].
-    T_K : float
-        Electron temperature [K].
-    wp_eV, eps_b, gamma_eV : float
-        Drude parameters.
-    Nr : int
-        Radial grid points.
-    lc_max : int
-        Maximum Coulomb multipole to sum over.
-
-    Returns
-    -------
-    gamma : float
-        Scattering rate [1/fs].
-    """
-    # energy transfer
-    omega_ij = E_i - E_j   # eV
-    abs_omega = abs(omega_ij)
-
-    if abs_omega < 1e-14:
-        return 0.0
-
-    # Bose-Einstein + step function factor
-    n_T = _bose_einstein(abs_omega, T_K)
-    if omega_ij > 0.0:
-        thermal_factor = n_T + 1.0   # emission: n_T + 1
+    if isinstance(eta_g_per_sphere, dict):
+        vals = np.array(list(eta_g_per_sphere.values()), dtype=float)
     else:
-        thermal_factor = n_T          # absorption: n_T
+        vals = np.asarray(eta_g_per_sphere, dtype=float).ravel()
 
-    # Drude permittivity at the transition frequency
-    eps_val = _eps_drude(abs_omega, wp_eV, eps_b, gamma_eV)
+    if vals.size < 2:
+        raise ValueError(
+            f"spatial_asymmetry_index requires at least 2 sphere values; "
+            f"got {vals.size}."
+        )
 
-    # dimensionless wavevectors beta = k_e * a
-    beta_i = ke(E_i) * a_nm
-    beta_j = ke(E_j) * a_nm
+    eta_max = float(np.max(vals))
+    eta_min = float(np.min(vals))
+    denom   = eta_max + eta_min
 
-    # Rescaled prefactor: 8*pi*k_C / (hbar * a)
-    # k_C = 1/(4*pi*eps0) [eV*nm],  hbar [eV*fs],  a [nm]
-    # => [eV*nm] / ([eV*fs] * [nm]) = 1/fs
-    # Multiplied by dimensionless |Ã|^2 terms => final units: 1/fs
-    k_C = 1.0 / (4.0 * np.pi * eps0)
-    prefactor = 8.0 * np.pi * k_C / (hbar * a_nm)
+    if denom == 0.0:
+        raise ValueError(
+            "eta_g_max + eta_g_min = 0; asymmetry index is undefined."
+        )
 
-    # sum over Coulomb multipoles l_c
-    sum_lc = 0.0
-    for l_c in range(1, lc_max + 1):
-        # triangle rule: |l_j - l_i| <= l_c <= l_j + l_i
-        if l_c < abs(l_j - l_i) or l_c > l_j + l_i:
-            continue
-
-        # parity rule: l_j + l_c + l_i must be even
-        if ((l_j + l_c + l_i) & 1) == 1:
-            continue
-
-        # angular factor (m-summed):
-        # sum_{m_j} |gaunt(l_j,l_c,l_i)|^2 / (2l_c+1)
-        #   = (2l_j+1)/(4*pi) * W^2(l_j,l_c,l_i,0,0,0)
-        W = Wigner3j(l_j, l_c, l_i, 0, 0, 0)
-        angular = (2.0 * l_j + 1.0) / (4.0 * np.pi) * (W * W)
-
-        if angular < 1e-30:
-            continue
-
-        # screened Coulomb Green's function
-        G_l = _Gl_screened(l_c, beta_j, l_j, beta_i, l_i, eps_val, Nr)
-
-        # we need -Im{G_l}
-        neg_imag_G = -G_l.imag
-
-        sum_lc += angular * neg_imag_G
-
-    gamma = prefactor * At2_i * At2_j * sum_lc * thermal_factor
-
-    return gamma
+    return (eta_max - eta_min) / denom
 
 
-# =============================================================================
-# B5. Full e-e scattering rate matrix (parallel over states)
-# =============================================================================
-
-@nb.njit(fastmath=True, parallel=True)
-def _ee_rate_matrix_parallel(
-    E_all: np.ndarray,       # float64[:], all bound energies
-    l_all: np.ndarray,       # int64[:], angular momentum for each state
-    At2_all: np.ndarray,     # float64[:], dimensionless |Ã|^2 = |A|^2 * a^3
-    a_nm: float,
-    T_K: float,
-    wp_eV: float,
-    eps_b: float,
-    gamma_eV: float,
-    Nr: int,
-    lc_max: int,
-) -> np.ndarray:
+def multipole_weight(X_lm_coeffs):
     """
-    Compute the full e-e scattering rate matrix gamma[j, i] (1/fs).
+    Compute the per-multipole-order weight from BCM coefficients.
 
-    gamma[j, i] = rate for electron to scatter from state i into state j.
+    For each angular momentum order ℓ, the weight is the sum of squared
+    moduli over all magnetic quantum numbers m::
+
+        W_ℓ = Σ_{m=-ℓ}^{ℓ} |X_{ℓm}|²
 
     Parameters
     ----------
-    E_all : float64[N]
-        Bound state energies [eV].
-    l_all : int64[N]
-        Angular momentum quantum number for each state.
-    At2_all : float64[N]
-        Dimensionless |Ã|^2 = |A|^2 * a^3  for each state.
-    a_nm : float
-        Sphere radius [nm].
-    T_K : float
-        Temperature [K].
-    wp_eV, eps_b, gamma_eV : float
-        Drude parameters.
-    Nr : int
-        Radial grid points for G_l computation.
-    lc_max : int
-        Maximum Coulomb multipole.
+    X_lm_coeffs : array-like, shape (n_coef,)
+        Complex BCM surface-charge coefficients for one sphere at one
+        frequency.  Accepted sources:
+
+        * ``BCMObject.coef_at(lam_um)``  — shape (n_coef,)
+        * ``coef[:, freq_idx]``          — one column of the sweep array
+
+        Ordering follows the BCM convention in ``bcm_sphere.py``: modes
+        are grouped by ℓ with m running from −ℓ to +ℓ, so the flat
+        index for (ℓ, m) is::
+
+            k(ℓ, m) = (ℓ - 1)(ℓ + 1) + (m + ℓ)
+
+        and the total number of modes is ``n_coef = lmax*(lmax + 2)``.
 
     Returns
     -------
-    gamma_matrix : float64[N, N]
-        Rate matrix in 1/fs.
+    weights : dict
+        ``{ℓ: W_ℓ}`` for ℓ = 1, 2, …, lmax (int keys, float values).
+
+    Raises
+    ------
+    ValueError
+        If ``len(X_lm_coeffs)`` does not equal ``lmax*(lmax+2)`` for
+        any integer lmax >= 1.
+
+    Notes
+    -----
+    Physical interpretation:
+
+    * For an isolated small sphere, ℓ = 1 (dipole) dominates.
+    * As the inter-sphere gap narrows, the strongly inhomogeneous
+      near-field drives higher multipoles: W_2 (quadrupole),
+      W_3 (octupole), … grow relative to W_1.
+    * Tracking ``multipole_weight`` across a gap sweep reveals the
+      onset of multipolar coupling and signals the breakdown of the
+      dipole approximation.
+
+    Examples
+    --------
+    >>> X_lm = sphere.coef_at(lam_peak)      # (n_coef,) complex array
+    >>> W = multipole_weight(X_lm)
+    >>> for l, w in W.items():
+    ...     print(f"  ℓ={l}: W={w:.4g}")
     """
-    N = E_all.size
-    gamma_matrix = np.zeros((N, N), dtype=np.float64)
+    X = np.asarray(X_lm_coeffs, dtype=complex).ravel()
+    n_coef = X.size
 
-    for j in prange(N):
-        E_j = E_all[j]
-        l_j = l_all[j]
-        At2_j = At2_all[j]
-        for i in range(N):
-            if i == j:
-                continue
-            E_i = E_all[i]
-            l_i = l_all[i]
-            At2_i = At2_all[i]
+    # Invert  n_coef = lmax*(lmax+2) = (lmax+1)^2 - 1
+    # => lmax + 1 = sqrt(n_coef + 1)  => lmax = round(sqrt(n_coef+1)) - 1
+    lmax = int(round(np.sqrt(n_coef + 1.0))) - 1
+    if lmax < 1 or lmax * (lmax + 2) != n_coef:
+        raise ValueError(
+            f"len(X_lm_coeffs) = {n_coef} is not consistent with any integer "
+            f"lmax >= 1 (expected lmax*(lmax+2) for some lmax)."
+        )
 
-            gamma_matrix[j, i] = _gamma_ee_pair(
-                E_i, l_i, At2_i,
-                E_j, l_j, At2_j,
-                a_nm, T_K,
-                wp_eV, eps_b, gamma_eV,
-                Nr, lc_max
+    weights = {}
+    for l in range(1, lmax + 1):
+        w = 0.0
+        for m in range(-l, l + 1):
+            k = (l - 1) * (l + 1) + (m + l)
+            w += X[k].real ** 2 + X[k].imag ** 2
+        weights[l] = w
+
+    return weights
+
+
+def gap_sweep(
+    geometry_builder,
+    gap_values_nm,
+    omega_grid,
+    params,
+):
+    """
+    Sweep the inter-sphere gap, run a full BCM solve at each step, and
+    locate the dominant absorption resonance.
+
+    Parameters
+    ----------
+    geometry_builder : callable
+        Factory ``g_nm -> list[BCMObject]``.  Called once per gap value
+        with the gap in nm; must return a list of fully initialised
+        ``BCMObject`` instances positioned for that gap.
+
+        For the homodimer case use ``get_preset_geometry`` from
+        ``plot_utils`` to obtain sphere centres, then wrap them in
+        ``BCMObject``::
+
+            from plytrons.plot_utils import get_preset_geometry
+            import plytrons.bcm_sphere as bcm
+
+            def dimer_builder(g):
+                positions = get_preset_geometry('Dimer', D, g)
+                return [bcm.BCMObject(label=f'Sp{i+1}', diameter=D,
+                                      lmax=lmax, eps=eps_func,
+                                      position=pos)
+                        for i, pos in enumerate(positions)]
+
+    gap_values_nm : array-like
+        Gap values Delta [nm] to sweep.  Each value is validated before
+        the BCM solve; a ``ValueError`` is raised if the gap is
+        non-positive or below ``MIN_GAP_TO_RADIUS_RATIO * R``.
+    omega_grid : ndarray
+        Angular frequency axis [rad s^-1] at which the BCM is solved.
+    params : dict
+        Must contain:
+
+        ``'efield'`` : EField
+            Incident plane-wave object.
+        ``'eps_h'`` : float
+            Host medium permittivity.
+        ``'sphere_diameter'`` : float
+            Sphere diameter D [nm].  Used only for the gap guard;
+            must match the diameter embedded in ``geometry_builder``.
+
+    Returns
+    -------
+    dict with keys:
+
+    ``'gap_nm'`` : ndarray, shape (Ngap,)
+        Swept gap values [nm].
+    ``'Qabs'`` : list of ndarray, each shape (Nomega,)
+        Total cluster absorption efficiency at each gap step.
+    ``'E_peak_eV'`` : ndarray, shape (Ngap,)
+        Dominant resonance energy [eV] at each gap step
+        (``nan`` when no peak is detected).
+    ``'lam_peak_um'`` : ndarray, shape (Ngap,)
+        Dominant resonance wavelength [um] at each gap step.
+    ``'BCM_objects'`` : list of list
+        ``BCMObject`` instances (with coefficients stored) per gap step.
+
+    Raises
+    ------
+    ValueError
+        If any gap value is non-positive or smaller than
+        ``MIN_GAP_TO_RADIUS_RATIO * sphere_radius``.
+
+    Notes
+    -----
+    The gap guard is applied **before** ``geometry_builder`` is called,
+    so no BCM matrices are assembled for invalid geometries.
+
+    Peak detection delegates to ``find_dominant_peak`` from
+    ``plot_utils`` (prominence-based, same logic as ``label_peaks``).
+    """
+    import plytrons.bcm_sphere as bcm
+    from scipy.constants import hbar as _hbar_si, eV as _eV_si
+    from scipy.constants import physical_constants as _phys
+
+    gap_values_nm = np.asarray(gap_values_nm, float)
+    omega_grid    = np.asarray(omega_grid,    float)
+
+    efield = params['efield']
+    eps_h  = float(params['eps_h'])
+    D      = float(params['sphere_diameter'])
+    R      = D / 2.0
+
+    # Derived axes
+    lam_um = 2.0 * np.pi * 2.998e14 / omega_grid   # [um]  (c in um/s)
+    E_eV   = omega_grid * _hbar_si / _eV_si          # [eV]
+
+    # Incident intensity from efield (project units: eV fs^-1 nm^-2)
+    _Z0_si = _phys["characteristic impedance of vacuum"][0]
+    _Z0    = _Z0_si * _eV_si
+    I0     = efield.E0 ** 2 / (2.0 * _Z0)
+
+    Qabs_list   = []
+    E_peaks     = []
+    lam_peaks   = []
+    bcm_lists   = []
+
+    for g in gap_values_nm:
+        g = float(g)
+
+        # ── gap guard ────────────────────────────────────────────────────
+        if g <= 0.0:
+            raise ValueError(
+                f"Gap must be positive; got g = {g:.6g} nm.  "
+                "Spheres are touching or overlapping."
+            )
+        g_min = MIN_GAP_TO_RADIUS_RATIO * R
+        if g < g_min:
+            raise ValueError(
+                f"Gap g = {g:.4f} nm is below the minimum allowed value "
+                f"MIN_GAP_TO_RADIUS_RATIO * R = {MIN_GAP_TO_RADIUS_RATIO} "
+                f"* {R:.3f} = {g_min:.4f} nm.  "
+                "The BCM multipole expansion may not converge at this separation."
             )
 
-    return gamma_matrix
-
-
-# =============================================================================
-# B6. e-e lifetimes  (SAG16 eqs 9, 10)
-# =============================================================================
-
-@nb.njit(cache=True, fastmath=True)
-def _ee_lifetimes_from_rates(
-    gamma_matrix: np.ndarray,    # (N, N)
-    E_all: np.ndarray,           # (N,)
-    E_F: float,
-    T_K: float,
-) -> np.ndarray:
-    """
-    Compute e-e lifetimes from the rate matrix.
-
-    For electrons (E_i > E_F):
-        1/tau_i = sum_j (1 - f_j) * gamma[j, i]     (eq 9)
-
-    For holes (E_i < E_F):
-        1/tau_i = sum_j f_j * gamma[i, j]            (eq 10)
-        (note: gamma[i,j] means scattering FROM j INTO i,
-         but for holes, it's the rate of filling the hole)
-
-    Parameters
-    ----------
-    gamma_matrix : float64[N, N]
-        Rate matrix gamma[j, i] in 1/fs.
-    E_all : float64[N]
-        Bound state energies [eV].
-    E_F : float
-        Fermi energy [eV].
-    T_K : float
-        Temperature [K].
-
-    Returns
-    -------
-    tau_ee : float64[N]
-        e-e lifetimes in fs.
-    """
-    N = E_all.size
-    tau_ee = np.empty(N, dtype=np.float64)
-
-    fd = _fermi_dirac(E_all, E_F, T_K)
-
-    for i in range(N):
-        inv_tau = 0.0
-
-        if E_all[i] >= E_F:
-            # electron above Fermi level (eq 9)
-            # 1/tau_i = sum_j (1 - f_j) * gamma_{j<-i}
-            for j in range(N):
-                if j == i:
-                    continue
-                inv_tau += (1.0 - fd[j]) * gamma_matrix[j, i]
-        else:
-            # hole below Fermi level (eq 10)
-            # 1/tau_i = sum_j f_j * gamma_{i<-j}
-            for j in range(N):
-                if j == i:
-                    continue
-                inv_tau += fd[j] * gamma_matrix[i, j]
-
-        if inv_tau > 1e-30:
-            tau_ee[i] = 1.0 / inv_tau
-        else:
-            tau_ee[i] = 1e30  # effectively infinite lifetime
-
-    return tau_ee
-
-
-# =============================================================================
-# B7. High-level wrappers (Python side)
-# =============================================================================
-
-def _flatten_states(e_state, a_nm: float):
-    """
-    Flatten List[QWLevelSet] into parallel arrays with dimensionless norms.
-
-    The normalization is rescaled to avoid floating-point issues:
-        |Ã|^2 = |A|^2 * a^3     (dimensionless, O(1))
-
-    This absorbs the a^5 from the Coulomb prefactor:
-        8*pi*k_C*a^5/hbar * |A_i|^2 * |A_j|^2
-      = 8*pi*k_C/(hbar*a) * |Ã_i|^2 * |Ã_j|^2
-
-    Returns
-    -------
-    E_all : float64[N]
-    l_all : int64[N]
-    At2_all : float64[N]   — dimensionless |Ã|^2
-    """
-    lmax = len(e_state)
-
-    # count total states
-    N = 0
-    for l in range(lmax):
-        N += e_state[l].Eb.size
-
-    E_all = np.empty(N, dtype=np.float64)
-    l_all = np.empty(N, dtype=np.int64)
-    At2_all = np.empty(N, dtype=np.float64)
-
-    a3 = a_nm ** 3   # scale factor
-
-    idx = 0
-    for l in range(lmax):
-        n_l = e_state[l].Eb.size
-        E_all[idx:idx+n_l] = e_state[l].Eb.real
-        l_all[idx:idx+n_l] = l
-        A_l = e_state[l].A
-        for n in range(n_l):
-            At2_all[idx + n] = (A_l[n] * A_l[n].conj()).real * a3
-        idx += n_l
-
-    return E_all, l_all, At2_all
-
-
-def ee_scattering_rates(
-    a_nm: float,
-    e_state,
-    T_K: float = 300.0,
-    wp_eV: float = 9.07,
-    eps_b: float = 4.18,
-    gamma_eV: float = 0.06,
-    Nr: int = 128,
-    lc_max: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute the full e-e scattering rate matrix.
-
-    Parameters
-    ----------
-    a_nm : float
-        Sphere radius [nm].
-    e_state : list[QWLevelSet] or numba.typed.List
-        Quantum-well bound states per l.
-    T_K : float
-        Electron temperature [K].
-    wp_eV, eps_b, gamma_eV : float
-        Drude dielectric parameters.
-    Nr : int
-        Radial grid points for G_l.
-    lc_max : int
-        Maximum Coulomb multipole. If 0, uses len(e_state)-1.
-
-    Returns
-    -------
-    gamma_matrix : float64[N, N]
-        Rate matrix gamma[j, i] in 1/fs.
-    E_all : float64[N]
-        Energies of all states [eV].
-    l_all : int64[N]
-        Angular momentum index of each state.
-    """
-    E_all, l_all, At2_all = _flatten_states(e_state, a_nm)
-
-    if lc_max <= 0:
-        lc_max = len(e_state) - 1
-    if lc_max < 1:
-        lc_max = 1
-
-    gamma_matrix = _ee_rate_matrix_parallel(
-        E_all, l_all, At2_all,
-        a_nm, T_K,
-        wp_eV, eps_b, gamma_eV,
-        Nr, lc_max,
-    )
-
-    return gamma_matrix, E_all, l_all
-
-
-def ee_lifetimes(
-    a_nm: float,
-    E_F: float,
-    e_state,
-    T_K: float = 300.0,
-    wp_eV: float = 9.07,
-    eps_b: float = 4.18,
-    gamma_eV: float = 0.06,
-    Nr: int = 128,
-    lc_max: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute electron-electron scattering lifetimes for all bound states.
-
-    Based on Saavedra et al., ACS Photonics 3, 1637 (2016), eqs 9-10, 14.
-
-    Parameters
-    ----------
-    a_nm : float
-        Sphere radius [nm].
-    E_F : float
-        Fermi energy [eV].
-    e_state : list[QWLevelSet] or numba.typed.List
-        Quantum-well bound states per l.
-    T_K : float
-        Electron temperature [K].
-    wp_eV, eps_b, gamma_eV : float
-        Drude dielectric parameters (default: Silver).
-    Nr : int
-        Radial grid points for the screened Coulomb integral.
-    lc_max : int
-        Maximum Coulomb multipole. If 0, uses len(e_state)-1.
-
-    Returns
-    -------
-    tau_ee : float64[N]
-        e-e lifetimes [fs] for each state.
-    E_all : float64[N]
-        Energies [eV], sorted by state index.
-    l_all : int64[N]
-        Angular momentum for each state.
-    """
-    gamma_matrix, E_all, l_all = ee_scattering_rates(
-        a_nm, e_state,
-        T_K=T_K, wp_eV=wp_eV, eps_b=eps_b, gamma_eV=gamma_eV,
-        Nr=Nr, lc_max=lc_max,
-    )
-
-    tau_ee = _ee_lifetimes_from_rates(gamma_matrix, E_all, E_F, T_K)
-
-    return tau_ee, E_all, l_all
-
-
-# #############################################################################
-#
-#  PART C  –  ELECTRON-PHONON SCATTERING
-#
-#  Reference: Saavedra, Asenjo-Garcia & Garcia de Abajo,
-#             ACS Photonics 3, 1637 (2016), "Inelastic Relaxation" section.
-#
-#  The e-ph coupling is phenomenological and state-independent:
-#
-#    (dp_i/dt)_{e-ph} = -γ^{e-ph} (p_i - p_i^0)
-#
-#  where p_i^0 = f(E_i, T_lattice) is the equilibrium Fermi-Dirac at the
-#  lattice temperature, and:
-#
-#    γ^{e-ph} = G / c_e(T_e)
-#
-#  G is the electron-lattice coupling coefficient:
-#    G_Au ≈ 3.0 × 10^16  W m^{-3} K^{-1}
-#    G_Ag ≈ 3.5 × 10^16  W m^{-3} K^{-1}
-#    G_Cu ≈ 1.0 × 10^17  W m^{-3} K^{-1}
-#
-#  c_e(T) is the electronic specific heat computed from the QW states:
-#    c_e(T) = (2/V) × ∂/∂T Σ_i E_i f_i(T)
-#
-#  For large particles this recovers the Sommerfeld linear law c_e = γ_S T,
-#  but for small particles finite-size effects produce non-monotonic behavior.
-#
-# #############################################################################
-
-# ── Unit conversion constants ──────────────────────────────────────────────
-# G is given in SI:  W m^{-3} K^{-1} = J s^{-1} m^{-3} K^{-1}
-# Our units:  eV, fs, nm, K
-#   1 J   = 1 / 1.602176634e-19 eV
-#   1 s   = 1e15 fs
-#   1 m^3 = 1e27 nm^3
-# => 1 W m^{-3} K^{-1} = (1/1.602176634e-19) / (1e15 × 1e27) eV fs^{-1} nm^{-3} K^{-1}
-#                        = 6.241509074e-24  eV fs^{-1} nm^{-3} K^{-1}
-_SI_TO_eVfsNm3K = 6.241509074e-24
-
-# Material e-ph coupling constants  (SI → our units)
-EPH_COUPLING = {
-    'Silver': 3.5e16 * _SI_TO_eVfsNm3K,   # eV/(fs·nm³·K)
-    'Gold':   3.0e16 * _SI_TO_eVfsNm3K,
-    'Copper': 1.0e17 * _SI_TO_eVfsNm3K,
-}
-
-
-# =============================================================================
-# C1. Electronic specific heat from QW states  (SAG16 eq in text)
-# =============================================================================
-
-@nb.njit(cache=True, fastmath=True)
-def _ce_from_states(
-    E_all: np.ndarray,     # (N,)  bound-state energies [eV]
-    deg_all: np.ndarray,   # (N,)  degeneracy 2(2l+1) per state
-    E_F: float,            # Fermi energy [eV]
-    T_K: float,            # electron temperature [K]
-    V_nm3: float,          # sphere volume [nm³]
-) -> float:
-    """
-    Electronic specific heat at constant particle number N.
-
-    Uses the canonical-ensemble variance formula which is always >= 0:
-
-        c_e = (1 / (V k_B T²)) × (K2 - K1²/K0)
-
-    where:
-        K0 = Σ_i g_i f_i(1-f_i)            (number susceptibility)
-        K1 = Σ_i g_i E_i f_i(1-f_i)        (mixed susceptibility)
-        K2 = Σ_i g_i E_i² f_i(1-f_i)       (energy susceptibility)
-
-    This correctly accounts for the temperature-dependent chemical
-    potential (dμ/dT) at fixed N, avoiding the negative c_e that
-    the naive grand-canonical derivative produces for discrete spectra.
-
-    Parameters
-    ----------
-    E_all : float64[N]
-        Bound-state energies [eV].
-    deg_all : float64[N]
-        Degeneracy per (n,l) level: 2(2l+1).
-    E_F : float
-        Chemical potential / Fermi energy [eV].
-    T_K : float
-        Electron temperature [K].
-    V_nm3 : float
-        Nanoparticle volume [nm³].
-
-    Returns
-    -------
-    c_e : float
-        Electronic specific heat [eV/(nm³·K)].
-    """
-    k_B = 8.617333262e-5   # eV/K
-    N = E_all.size
-
-    if T_K < 1.0:
-        T_K = 1.0  # guard against division by zero
-
-    kT = k_B * T_K
-
-    K0 = 0.0   # Σ g_i f(1-f)
-    K1 = 0.0   # Σ g_i E_i f(1-f)
-    K2 = 0.0   # Σ g_i E_i² f(1-f)
-
-    for i in range(N):
-        E_i = E_all[i]
-        arg = (E_i - E_F) / kT
-        # guard against overflow in exp
-        if arg > 500.0:
-            f_i = 0.0
-        elif arg < -500.0:
-            f_i = 1.0
-        else:
-            f_i = 1.0 / (np.exp(arg) + 1.0)
-
-        ff = f_i * (1.0 - f_i)
-        g_i = deg_all[i]
-        K0 += g_i * ff
-        K1 += g_i * E_i * ff
-        K2 += g_i * E_i * E_i * ff
-
-    # Canonical variance:  Var(E)|_N = K2 - K1²/K0
-    if K0 < 1e-30:
-        return 0.0
-
-    variance = K2 - (K1 * K1) / K0
-
-    # c_e = variance / (V k_B T²)
-    c_e = variance / (V_nm3 * k_B * T_K * T_K)
-
-    return c_e
-
-
-# =============================================================================
-# C2. e-ph relaxation rate  γ^{e-ph} = G / c_e(T)
-# =============================================================================
-
-@nb.njit(cache=True, fastmath=True)
-def _eph_rate_scalar(G_eVfsNm3K: float, c_e: float) -> float:
-    """
-    Electron-phonon relaxation rate.
-
-    Parameters
-    ----------
-    G_eVfsNm3K : float
-        e-ph coupling constant [eV/(fs·nm³·K)].
-    c_e : float
-        Electronic specific heat [eV/(nm³·K)].
-
-    Returns
-    -------
-    gamma_eph : float
-        Relaxation rate [1/fs].
-    """
-    if c_e < 1e-30:
-        return 0.0
-    return G_eVfsNm3K / c_e
-
-
-# =============================================================================
-# C3. High-level wrappers  (Python side)
-# =============================================================================
-
-def _flatten_states_with_deg(e_state):
-    """
-    Flatten states into arrays including degeneracy g = 2(2l+1).
-
-    Returns
-    -------
-    E_all : float64[N]
-    l_all : int64[N]
-    deg_all : float64[N]   — degeneracy per (n,l) level
-    """
-    lmax = len(e_state)
-    N = sum(e_state[l].Eb.size for l in range(lmax))
-
-    E_all = np.empty(N, dtype=np.float64)
-    l_all = np.empty(N, dtype=np.int64)
-    deg_all = np.empty(N, dtype=np.float64)
-
-    idx = 0
-    for l in range(lmax):
-        n_l = e_state[l].Eb.size
-        g_l = 2.0 * (2 * l + 1)   # spin × magnetic degeneracy
-        E_all[idx:idx+n_l] = e_state[l].Eb.real
-        l_all[idx:idx+n_l] = l
-        deg_all[idx:idx+n_l] = g_l
-        idx += n_l
-
-    return E_all, l_all, deg_all
-
-
-def electronic_specific_heat(
-    a_nm: float,
-    E_F: float,
-    e_state,
-    T_K: float = 300.0,
-) -> float:
-    """
-    Electronic specific heat from the QW bound states.
-
-    c_e(T) = (1/V) Σ_i g_i × E_i × (E_i - μ)/(k_B T²) × f_i(1-f_i)
-
-    For large particles this recovers the Sommerfeld linear law c_e ≈ γ_S T.
-    For small particles, finite-size quantization produces deviations.
-
-    Parameters
-    ----------
-    a_nm : float
-        Sphere radius [nm].
-    E_F : float
-        Chemical potential [eV].
-    e_state : list[QWLevelSet]
-        Quantum-well bound states.
-    T_K : float
-        Electron temperature [K].
-
-    Returns
-    -------
-    c_e : float
-        Electronic specific heat [eV/(nm³·K)].
-    """
-    E_all, _, deg_all = _flatten_states_with_deg(e_state)
-    V = (4.0 / 3.0) * np.pi * a_nm**3
-    return _ce_from_states(E_all, deg_all, E_F, T_K, V)
-
-
-def eph_rate(
-    a_nm: float,
-    E_F: float,
-    e_state,
-    T_K: float = 300.0,
-    G_SI: float = 3.5e16,
-) -> float:
-    """
-    Electron-phonon relaxation rate  γ^{e-ph} = G / c_e(T_e).
-
-    Parameters
-    ----------
-    a_nm : float
-        Sphere radius [nm].
-    E_F : float
-        Chemical potential [eV].
-    e_state : list[QWLevelSet]
-        Quantum-well bound states.
-    T_K : float
-        Electron temperature [K].
-    G_SI : float
-        Electron-lattice coupling constant [W/(m³·K)].
-        Default: 3.5×10^16 (Silver).
-
-    Returns
-    -------
-    gamma_eph : float
-        Relaxation rate [1/fs].
-    """
-    G_our = G_SI * _SI_TO_eVfsNm3K
-    c_e = electronic_specific_heat(a_nm, E_F, e_state, T_K)
-    return _eph_rate_scalar(G_our, c_e)
-
-
-def eph_lifetime(
-    a_nm: float,
-    E_F: float,
-    e_state,
-    T_K: float = 300.0,
-    G_SI: float = 3.5e16,
-) -> float:
-    """
-    Electron-phonon relaxation lifetime  τ^{e-ph} = 1/γ^{e-ph} [fs].
-
-    Parameters
-    ----------
-    a_nm : float
-        Sphere radius [nm].
-    E_F : float
-        Chemical potential [eV].
-    e_state : list[QWLevelSet]
-        Quantum-well bound states.
-    T_K : float
-        Electron temperature [K].
-    G_SI : float
-        Electron-lattice coupling constant [W/(m³·K)].
-        Default: 3.5×10^16 (Silver).
-
-    Returns
-    -------
-    tau_eph : float
-        Relaxation lifetime [fs].
-    """
-    gamma = eph_rate(a_nm, E_F, e_state, T_K, G_SI)
-    if gamma < 1e-30:
-        return 1e30
-    return 1.0 / gamma
-
-
-def eph_rate_vs_temperature(
-    a_nm: float,
-    E_F: float,
-    e_state,
-    T_array_K: np.ndarray,
-    G_SI: float = 3.5e16,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute γ^{e-ph}(T) and c_e(T) over a temperature array.
-
-    Useful for plotting the temperature dependence and comparing
-    with the Sommerfeld (linear c_e) approximation.
-
-    Parameters
-    ----------
-    a_nm : float
-        Sphere radius [nm].
-    E_F : float
-        Chemical potential [eV].
-    e_state : list[QWLevelSet]
-        Quantum-well bound states.
-    T_array_K : ndarray
-        Temperature values [K].
-    G_SI : float
-        Electron-lattice coupling constant [W/(m³·K)].
-
-    Returns
-    -------
-    gamma_eph : float64[N_T]
-        Relaxation rate [1/fs] at each temperature.
-    c_e : float64[N_T]
-        Electronic specific heat [eV/(nm³·K)] at each temperature.
-    """
-    T_array_K = np.asarray(T_array_K, dtype=np.float64)
-    G_our = G_SI * _SI_TO_eVfsNm3K
-
-    E_all, _, deg_all = _flatten_states_with_deg(e_state)
-    V = (4.0 / 3.0) * np.pi * a_nm**3
-
-    N_T = T_array_K.size
-    gamma_out = np.empty(N_T, dtype=np.float64)
-    ce_out = np.empty(N_T, dtype=np.float64)
-
-    for i in range(N_T):
-        ce_i = _ce_from_states(E_all, deg_all, E_F, T_array_K[i], V)
-        ce_out[i] = ce_i
-        gamma_out[i] = _eph_rate_scalar(G_our, ce_i)
-
-    return gamma_out, ce_out
-
-
-# #############################################################################
-#
-#  PART D  –  EFFECTIVE LIFETIME  (e-e + e-ph combined)
-#
-#  Reference: Saavedra et al. ACS Photonics 3, 1637 (2016)
-#
-#  The total inelastic lifetime of state i is:
-#
-#    1/τ_eff(i)  =  1/τ_ee(i)  +  1/τ_eph
-#
-#  where τ_ee(i) is state-dependent (from Part B) and τ_eph is a single
-#  scalar for all states (from Part C).  This combined lifetime replaces
-#  the phenomenological τ used as a free parameter in hot_e_dist().
-#
-# #############################################################################
-
-
-def effective_lifetime(
-    a_nm: float,
-    E_F: float,
-    e_state,
-    T_K: float = 300.0,
-    wp_eV: float = 3.81,
-    eps_b: float = 5.0,
-    gamma_eV: float = 0.07,
-    G_SI: float = 3.5e16,
-    Nr: int = 128,
-    lc_max: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """
-    Combined effective inelastic lifetime per state:  1/τ_eff = 1/τ_ee + 1/τ_eph.
-
-    Parameters
-    ----------
-    a_nm : float
-        Sphere radius [nm].
-    E_F : float
-        Fermi energy [eV].
-    e_state : list[QWLevelSet]
-        Quantum-well states.
-    T_K : float
-        Electron temperature [K].
-    wp_eV, eps_b, gamma_eV : float
-        Drude parameters for the screened Coulomb interaction.
-    G_SI : float
-        Electron-phonon coupling constant [W/(m³·K)].
-    Nr : int
-        Radial grid points for the screened Coulomb Green's function.
-    lc_max : int
-        Maximum Coulomb multipole order (0 = auto).
-
-    Returns
-    -------
-    tau_eff : float64[N]
-        Effective lifetime per state [fs], energy-sorted order.
-    E_sorted : float64[N]
-        State energies [eV], sorted ascending.
-    l_sorted : int64[N]
-        Angular momentum quantum numbers, energy-sorted order.
-    tau_eph : float
-        Scalar e-ph lifetime [fs] (same for all states).
-    """
-    # --- e-e lifetimes (l-ordered) ---
-    tau_ee, E_all, l_all = ee_lifetimes(
-        a_nm, E_F, e_state,
-        T_K=T_K, wp_eV=wp_eV, eps_b=eps_b, gamma_eV=gamma_eV,
-        Nr=Nr, lc_max=lc_max,
-    )
-
-    # --- e-ph lifetime (scalar) ---
-    tau_eph = eph_lifetime(a_nm, E_F, e_state, T_K=T_K, G_SI=G_SI)
-
-    # --- combine: 1/τ_eff = 1/τ_ee + 1/τ_eph ---
-    # States with infinite τ_ee (Pauli-blocked) contribute only τ_eph
-    tau_ee_safe = np.where(np.isfinite(tau_ee) & (tau_ee > 0), tau_ee, 1e30)
-    tau_eff = 1.0 / (1.0 / tau_ee_safe + 1.0 / tau_eph)
-
-    # --- sort by energy (to match hot_e_dist output ordering) ---
-    sort_idx = np.argsort(E_all)
-    return tau_eff[sort_idx], E_all[sort_idx], l_all[sort_idx], tau_eph
-
-
-def hot_e_dist_resolved(
-    a_nm: float,
-    hv_eV: float,
-    E_F: float,
-    tau_eff_sorted: np.ndarray,
-    e_state,
-    X_lm: np.ndarray,
-    Pabs: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
-    """
-    Hot-carrier generation with state-resolved effective lifetimes.
-
-    Each electronic state carries its own Lorentzian broadening
-    γ_i = ħ/τ_eff[i].  For the electron (hole) channel the broadening
-    is set by the lifetime of the initially occupied state:
-
-      denom_e[f, i] = (ħω - E_f + E_i)² + (ħ/τ_eff[i])²   [electron, initial = i]
-      denom_h[f, i] = (ħω - E_i + E_f)² + (ħ/τ_eff[f])²   [hole,     initial = f]
-
-    Parameters
-    ----------
-    a_nm : float
-        Sphere radius [nm].
-    hv_eV : float
-        Photon energy [eV].
-    E_F : float
-        Fermi energy [eV].
-    tau_eff_sorted : float64[N]
-        Effective lifetime per state [fs] in energy-sorted order.
-        Obtain from :func:`effective_lifetime`.
-    e_state : list[QWLevelSet]
-        Quantum-well bound states.
-    X_lm : ndarray
-        BCM multipole coefficients at the photon wavelength.
-    Pabs : float
-        Absorbed power [eV/fs] (used for normalization).
-
-    Returns
-    -------
-    Te, Th : float64[N]
-        Hot electron/hole generation rate density [1/(fs·nm³)].
-    Te_raw, Th_raw : float64[N]
-        Unnormalized generation rates (before volume division) [1/fs].
-    Mfi2_sorted : float64[N, N]
-        Optical transition matrix |M_{fi}|² in energy-sorted order.
-    E_sorted : float64[N]
-        State energies [eV], sorted ascending.
-    S : float
-        Normalisation factor  Pabs / P_diss.
-    Pabs_out : float
-        Absorbed power [eV/fs] (echo of input).
-    P_diss : float
-        Computed dissipated power [eV/fs] before normalisation.
-    """
-    tau_eff_sorted = np.asarray(tau_eff_sorted, dtype=np.float64)
-
-    # ── Step 1: get Mfi² matrix from the existing Numba kernel ──────────────
-    # We call hot_e_dist with a dummy tau to extract Mfi2_sorted and E_sorted.
-    # The matrix elements do NOT depend on τ — only the Lorentzian does.
-    tau_dummy = np.array([500.0])
-    _, _, _, _, Mfi2_sorted, E_sorted, _, _, _ = hot_e_dist(
-        a_nm, hv_eV, E_F, tau_dummy, e_state, X_lm, Pabs
-    )
-
-    N = len(E_sorted)
-
-    # ── Step 2: Fermi-Dirac occupations ─────────────────────────────────────
-    fd = _fermi_dirac(E_sorted, E_F)
-    fd_i = fd[np.newaxis, :]   # (1, N) — occupations indexed by initial state i
-    fd_f = fd[:, np.newaxis]   # (N, 1) — occupations indexed by final/hole state f
-
-    # ── Step 3: per-state Lorentzian widths  γ = ħ/τ ────────────────────────
-    gamma_all = hbar / tau_eff_sorted          # shape (N,)
-    gamma_col = gamma_all[np.newaxis, :]       # (1, N) — broadening from state i
-    gamma_row = gamma_all[:, np.newaxis]       # (N, 1) — broadening from state f
-
-    EE_f = E_sorted[:, np.newaxis]             # (N, 1)
-    EE_i = E_sorted[np.newaxis, :]             # (1, N)
-
-    # Denominators: each channel uses the lifetime of its *initial* occupied state
-    denom_e = (hv_eV - EE_f + EE_i) ** 2 + gamma_col ** 2   # electron: initial = i
-    denom_h = (hv_eV - EE_i + EE_f) ** 2 + gamma_row ** 2   # hole:     initial = f
-
-    # ── Step 4: transition rate matrices ────────────────────────────────────
-    # Prefactor 4γ/ħ = 4/τ (per-column for electrons, per-row for holes)
-    pf_e = 4.0 * gamma_col / hbar    # (1, N)
-    pf_h = 4.0 * gamma_row / hbar    # (N, 1)
-
-    TTe = pf_e * fd_i * (1.0 - fd_f) * (
-        Mfi2_sorted / denom_e + Mfi2_sorted.T / denom_h
-    )
-    TTh = pf_h * fd_f * (1.0 - fd_i) * (
-        Mfi2_sorted / denom_h + Mfi2_sorted.T / denom_e
-    )
-
-    Te_raw = TTe.sum(axis=1)   # sum over initial states i
-    Th_raw = TTh.sum(axis=1)
-
-    # ── Step 5: normalise by absorbed power ─────────────────────────────────
-    P_diss = 0.0
-    for f in range(N):
-        for i in range(N):
-            dE = E_sorted[f] - E_sorted[i]
-            if dE > 0.0:
-                P_diss += dE * TTe[f, i]
-
-    if P_diss <= 0.0 or not np.isfinite(P_diss):
-        P_diss = 1e-300
-
-    S = Pabs / P_diss
-    Vol = (4.0 / 3.0) * np.pi * a_nm ** 3
-
-    Te = S * Te_raw / Vol
-    Th = S * Th_raw / Vol
-    Te_raw_out = S * Te_raw
-    Th_raw_out = S * Th_raw
-
-    return Te, Th, Te_raw_out, Th_raw_out, Mfi2_sorted, E_sorted, S, Pabs, P_diss
+        # ── geometry + matrices ──────────────────────────────────────────
+        BCM_objects = geometry_builder(g)
+        Np = len(BCM_objects)
+
+        Gi = [bcm.Ginternal(obj) for obj in BCM_objects]
+        G0 = [[bcm.Gexternal(BCM_objects[i], BCM_objects[j])
+               for j in range(Np)] for i in range(Np)]
+        Sv = [bcm.Efield_coupling(obj, efield) for obj in BCM_objects]
+
+        # ── frequency sweep ──────────────────────────────────────────────
+        n_coef   = BCM_objects[0].n_coef
+        coef_all = [np.zeros((n_coef, len(omega_grid)), dtype=complex)
+                    for _ in range(Np)]
+
+        for il, wi in enumerate(omega_grid):
+            c, _ = bcm.solve_BCM(wi, eps_h, BCM_objects, efield, Gi, G0, Sv)
+            for sp in range(Np):
+                coef_all[sp][:, il] = c[sp]
+
+        for sp, obj in enumerate(BCM_objects):
+            obj.set_coefficients(lam_um, coef_all[sp])
+
+        # ── power and Q_abs ──────────────────────────────────────────────
+        _, Pabs = bcm.EM_power(omega_grid, eps_h, Gi, G0, BCM_objects)
+        Pabs_total = sum(Pabs[i] for i in range(Np))
+        A_ref  = Np * np.pi * R ** 2          # total geometric cross-section [nm^2]
+        Qabs   = Pabs_total / (I0 * A_ref)
+
+        # ── dominant peak via plot_utils ─────────────────────────────────
+        pk_idx, E_pk = find_dominant_peak(E_eV, Qabs)
+        lam_pk = float(lam_um[pk_idx]) if pk_idx is not None else float('nan')
+        E_pk   = E_pk if E_pk is not None else float('nan')
+
+        Qabs_list.append(Qabs)
+        E_peaks.append(E_pk)
+        lam_peaks.append(lam_pk)
+        bcm_lists.append(BCM_objects)
+
+    return {
+        'gap_nm':      gap_values_nm,
+        'Qabs':        Qabs_list,
+        'E_peak_eV':   np.array(E_peaks),
+        'lam_peak_um': np.array(lam_peaks),
+        'BCM_objects': bcm_lists,
+    }
+
+
+# GIF animation helpers (combined_absorption_hotcarriers_gif,
+# static_multi_resonance_grid_gif) live in plot_utils.py — import
+# them directly from there.

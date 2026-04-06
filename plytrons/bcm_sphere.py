@@ -19,8 +19,7 @@ import numpy as np
 from functools import lru_cache
 import numba as nb
 from math import factorial
-from plytrons.wigner3j import clebsch_gordan
-from plytrons.math_utils import em_sph_harm
+from plytrons.math_utils import clebsch_gordan, em_sph_harm
 from dataclasses import dataclass, field
 from functools   import cached_property
 from typing import Callable, Optional, Union

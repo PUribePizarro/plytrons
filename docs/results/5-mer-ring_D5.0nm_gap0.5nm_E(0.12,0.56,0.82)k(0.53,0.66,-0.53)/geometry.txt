@@ -1,8 +1,0 @@
-N particles: 5
-sphere1: label=Sphere1_Silver, D=5.000 nm, pos=(0.000, 0.000, 4.679) nm, lmax=10
-sphere2: label=Sphere2_Gold, D=5.000 nm, pos=(0.000, -4.450, 1.446) nm, lmax=10
-sphere3: label=Sphere3_Copper, D=5.000 nm, pos=(0.000, -2.750, -3.785) nm, lmax=10
-sphere4: label=Sphere4_Silver, D=5.000 nm, pos=(0.000, 2.750, -3.785) nm, lmax=10
-sphere5: label=Sphere5_Gold, D=5.000 nm, pos=(0.000, 4.450, 1.446) nm, lmax=10
-eps_h=1.77
-E0=1 V/nm, e_hat=[0.11759022 0.5613004  0.81921572], k_hat=[ 0.52981294  0.66226618 -0.52981294]

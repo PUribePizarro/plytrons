@@ -5,14 +5,14 @@ from typing import List, Tuple
 import numpy as np
 import numba as nb
 from numba import prange
-from numba.typed import List as _NList   # ← NEW
+from numba.typed import List as _NList
 
 # ── Project‑specific helpers ───────────────────────────────────────────────
-from plytrons.math_utils import eps0, hbar, nb_meshgrid
-from plytrons.wigner3j import Wigner3j, gaunt_coeff
+from plytrons.math_utils import eps0, hbar, nb_meshgrid, Wigner3j
 from plytrons.quantum_well import js_real, ke, QWLevelSet
 
-__all__ = ["hot_e_dist"]
+__all__ = ["hot_e_dist", "hot_e_cdf_per_photon", "count_eh_generated",
+           "generation_efficiency"]
 
 # =============================================================================
 # 1. Low‑level utilities
@@ -185,109 +185,6 @@ def _M_transition_squared(
     # include |Af*Ai|^2
     return Mfi_2 * AA_abs2
 
-# @nb.njit(fastmath=False, parallel = False)
-# def _M_transition_squared(
-#     lf: int,
-#     li: int,
-#     a_nm: float,
-#     X_lm: np.ndarray,     # complex128[:]
-#     state_f: QWLevelSet,
-#     state_i: QWLevelSet,
-# ) -> np.ndarray:
-#     """Compute *Mᶠᵢ* for a given pair of quantum numbers (l_f, m_f) ← (l_i, m_i)."""
-    
-#     # get parameters of final state
-#     Ef, Af = state_f.Eb.real.astype(np.float64), state_f.A
-#     n_f = Ef.size
-
-#     # get parameters of initial state
-#     Ei, Ai = state_i.Eb.real.astype(np.float64), state_i.A
-#     n_i = Ei.size
-
-#     # |Af*Ai|^2 as an outer product -> (n_f, n_i)
-#     AAi, AAf = nb_meshgrid(Ai, Af)          # shapes (n_i, n_f) & (n_f, n_i)
-
-#     AA_abs2 = np.abs(AAf.conj() * AAi)**2    # (n_f, n_i), real
-
-#     # ----- radial grid & Bessels -------------------------------------------
-#     Nr = 128
-#     r = np.linspace(0.001, a_nm, Nr)      # (Nr,)
-#     rr = r[:, None]                          # (Nr, 1) for broadcasting
-
-#     # Bessel columns: A=(Nr,n_f), B=(Nr,n_i)
-#     j_lf = js_real(lf, ke(Ef[None, :]) * rr)       # j_lf(k_f r)
-#     j_li = js_real(li, ke(Ei[None, :]) * rr)       # j_li(k_i r)
-
-#     # trapezoid weights along r (Numba-safe)
-#     dr = 0.0 if Nr < 2 else (r[1] - r[0])
-#     w  = np.full(Nr, dr, dtype=np.float64)
-#     if Nr >= 1:
-#         w[0] *= 0.5
-#         w[-1] *= 0.5
-
-#     # will accumulate the real, positive squared amplitudes
-#     Mfi_2 = np.zeros((n_f, n_i), dtype=np.float64)
-
-#     # max l present in X_lm
-#     le_max = idx_to_lm(X_lm.size - 1)[0]
-
-#     for le in range(1, int(le_max) + 1):
-
-#         # triangle rule: |lf - li| <= le <= lf + li
-#         if le < abs(li - lf) or le > li + lf:
-#             continue
-
-#         # even-sum rule: lf + le + li must be even
-#         if ((lf + le + li) & 1) == 1:
-#             continue
-
-#        # ---------- Integration along solid angle ---------------------
-#         # power in field multipole le: P_le = sum_m |X_{le m}|^2
-#         idx0 = lm_to_idx(le, -le)
-#         idx1 = lm_to_idx(le,  le) + 1
-#         Xl = X_lm[idx0:idx1]
-
-#         # Numba-friendly real power sum
-#         X_lm_sum = 0.0
-#         for x_lm in Xl:
-#             X_lm_sum += x_lm.real * x_lm.real + x_lm.imag * x_lm.imag
-
-#         if X_lm_sum <= 1e-5:
-#             continue
-
-#         # angular factor from m_i, m_f sums (orthogonality of 3j’s)
-#         W = Wigner3j(lf, le, li, 0, 0, 0)     # order is harmless once squared
-#         Mfi_ang2 = ((2.0*lf + 1.0) * (2.0*li + 1.0) / (4.0*np.pi*(2*le + 1))) * (W * W) * X_lm_sum
-
-
-                    
-#         # amplitude prefactor, squared (same physics as in _transition_M)
-#         # note: this is distinct from the orthogonality 1/(2le+1) that cancelled
-#         pref = (1.0/eps0) * np.sqrt(le / (a_nm**3))/np.sqrt(2*le + 1)
-#         scale2 = (pref / (a_nm**(le - 1)))**2  # real
-
-#         # radial integrals for each Ef row
-#         # build weights r^(le+2)*w once per le
-#         rw = np.empty(Nr, dtype=np.float64)
-#         for ii in range(Nr):
-#             rw[ii] = w[ii] * (r[ii] ** (le + 2))
-
-#         # compute weighted B, then a single GEMM for all (f,i):
-#         # I = ∫ j_lf(k_f r) j_li(k_i r) r^(le+2) dr → (n_f, n_i)
-#         j_li_w = (rw[:, None]) * j_li                  # (Nr, n_i)
-
-#         j_lf_T  = np.ascontiguousarray(j_lf.T)   # (n_f, Nr)
-#         j_li_wc = np.ascontiguousarray(j_li_w)   # (Nr, n_i)
-#         I = j_lf_T @ j_li_wc                        # (n_f, n_i)
-
-#         # accumulate squared integral
-#         Mfi_2 += scale2 * Mfi_ang2 * (I * I)        # all real
-
-#         # print(AA_abs2, Mfi_ang2, (I * I))
-
-#     # include |Af*Ai|^2
-#     return Mfi_2 * AA_abs2
-
 # =============================================================================
 # 3. Parallel driver with full (l,m) summation
 # =============================================================================
@@ -316,7 +213,6 @@ def _hot_e_dist_parallel(
 
     # global transition matrices
     Mfi_2_all = np.zeros((N, N), dtype=np.float64)
-    # Mif_2_all = np.zeros_like(Mfi_2_all)
 
     # outer parallelism over final l index ----------------------------------
     for lf in prange(lmax):
@@ -326,13 +222,8 @@ def _hot_e_dist_parallel(
             state_li = e_state[li]
             li_s, li_e = l_range[li], l_range[li + 1]
 
-            # Compute transition matrix for pair (lf, li)
             Mfi_2_block = _M_transition_squared(lf, li, a_nm, X_lm, state_lf, state_li)
-            # Mif_2_block = _M_transition_squared(li, lf, a_nm, X_lm, state_li, state_lf)
-
-            # place blocks into global matrices
             Mfi_2_all[lf_s:lf_e, li_s:li_e] = Mfi_2_block
-            # Mif_2_all[li_s:li_e, lf_s:lf_e] = Mif_2_block
 
 # --- Golden‑rule probability matrices ----------------------------------
     EE_i, EE_f = nb_meshgrid(E_all, E_all)
@@ -380,24 +271,11 @@ def _hot_e_dist_parallel(
         if P_diss <= 0.0 or not np.isfinite(P_diss):
             P_diss = 1e-300
 
-        Pabs_fs = Pabs  # eV/fs
-        S = Pabs_fs / P_diss
+        S = Pabs / P_diss
+        Vol = 4/3*np.pi*a_nm**3
 
-
-        # # after you build the per-transition rate matrix R_fi (shape Nf x Ni)
-        # # (in your notation, something like TTe before summing)
-        # DeltaE = (EE_f - EE_i)  # eV
-        # P_diss = np.sum(DeltaE * TTe)  # eV/fs  (or eV/ps depending on your tau unit)
-        # S = Pabs / P_diss
-
-
-        Vol = 4/3*np.pi*a_nm**3                # Volume of sphere (nm^3)
-        # Gamma_e_total = np.sum(Te_raw)     # total electron gen. rate = sum over f (per fs)
-        # S = Pabs / (hv_eV * Gamma_e_total)     # dimensionless scaling
-    
-        
         Te[i] = S * Te_raw/Vol
-        Th[i] = S * Th_raw/Vol
+        Th[i] = S * Th_raw / Vol
         Te_raw_[i] = S * Te_raw
         Th_raw_[i] = S * Th_raw
 
@@ -413,7 +291,7 @@ def _hot_e_dist_parallel(
             j_old = order[jj]
             Mfi_2_sorted[ii, jj] = Mfi_2_all[i_old, j_old]
 
-    return Te, Th, Te_raw_, Th_raw_, Mfi_2_sorted, E_sorted, S, Pabs_fs, P_diss
+    return Te, Th, Te_raw_, Th_raw_, Mfi_2_sorted, E_sorted, S, Pabs, P_diss
 
 
 # =============================================================================
@@ -548,3 +426,86 @@ def count_eh_generated(
     Ne_levels = t[..., None] * Te_row[None, ...] if t.ndim else t * Te_row
     Nh_levels = t[..., None] * Th_row[None, ...] if t.ndim else t * Th_row
     return Ne, Nh, Ne_levels, Nh_levels
+
+
+# =============================================================================
+# 6. Generation efficiency
+# =============================================================================
+
+def generation_efficiency(
+    E_f: np.ndarray,
+    Gamma_e: np.ndarray,
+    omega_eV: float,
+    Pabs: float,
+) -> float:
+    """
+    Compute the hot-electron generation efficiency eta_g.
+
+    eta_g is the fraction of absorbed photons that produce a hot electron
+    above the Fermi level::
+
+        eta_g = N_dot_e / (P_abs / hbar*omega)
+
+    where ``N_dot_e = sum_f Gamma_e(E_f)`` is the total electron generation
+    rate (sum of per-level rates over all final states *f*) and
+    ``P_abs / hbar*omega`` is the absorbed-photon flux (photons per unit time).
+
+    Parameters
+    ----------
+    E_f : ndarray, shape (N,)
+        Final-state energies [eV].  Passed for caller identification and
+        optional energy-resolved post-processing; not used in the
+        summation itself.
+    Gamma_e : ndarray, shape (N,)
+        Per-level electron generation rate Gamma_e(E_f) [fs^-1].
+        These are the values in ``Te_raw_[tau_index]`` returned by
+        `hot_e_dist` after the absorbed-power normalisation.
+    omega_eV : float
+        Photon energy hbar*omega [eV].  Must be positive.
+    Pabs : float
+        Absorbed power [eV fs^-1].  Must be positive.
+
+    Returns
+    -------
+    eta_g : float
+        Dimensionless generation efficiency.  A value of 1 means every
+        absorbed photon creates one hot electron; values less than 1
+        indicate competing loss channels (e.g. intra-band absorption,
+        momentum-forbidden transitions).
+
+    Raises
+    ------
+    ValueError
+        If ``Pabs`` or ``omega_eV`` is not strictly positive.
+
+    Notes
+    -----
+    Units are consistent throughout:
+
+    * ``N_dot_e = sum(Gamma_e)`` has units [fs^-1].
+    * ``P_abs / hbar*omega`` has units [eV fs^-1] / [eV] = [fs^-1].
+    * Their ratio eta_g is dimensionless.
+
+    ``hbar*omega`` is simply ``omega_eV`` because ``Gamma_e`` and ``Pabs``
+    are already expressed in the project's eV / fs unit system
+    (``hbar = 0.6582 eV fs`` absorbed into the numerical values by
+    `hot_e_dist`).
+
+    Examples
+    --------
+    >>> Te, Th, Te_raw_, Th_raw_, Mfi2, E_sorted, S, Pabs, P_diss = hot_e_dist(...)
+    >>> eta = generation_efficiency(E_sorted, Te_raw_[0], hv_eV, Pabs)
+    >>> print(f"eta_g = {eta:.3f}")
+    """
+    E_f     = np.asarray(E_f,     dtype=np.float64)
+    Gamma_e = np.asarray(Gamma_e, dtype=np.float64)
+
+    if Pabs <= 0.0:
+        raise ValueError(f"Pabs must be positive, got {Pabs!r}")
+    if omega_eV <= 0.0:
+        raise ValueError(f"omega_eV must be positive, got {omega_eV!r}")
+
+    N_dot_e     = float(np.sum(Gamma_e))   # total electron generation rate [fs^-1]
+    photon_rate = Pabs / omega_eV          # absorbed photon rate [fs^-1]
+
+    return N_dot_e / photon_rate

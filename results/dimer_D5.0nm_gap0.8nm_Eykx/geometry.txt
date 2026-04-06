@@ -1,8 +1,0 @@
-structure=2
-Δ=0.822222 nm
-pol=Ey(kx)
-N particles: 2
-sphere1: label=Sphere1, D=5.000 nm, pos=(0.000,2.911,0.000) nm, lmax=10
-sphere2: label=Sphere2, D=5.000 nm, pos=(0.000,-2.911,0.000) nm, lmax=10
-eps_h=1.0
-E0=1.0 V/nm, e_hat=[0. 1. 0.], k_hat=[1. 0. 0.]
