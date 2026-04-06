@@ -13,7 +13,10 @@ import plytrons.bcm_sphere as bcm
 from scipy.constants import hbar, eV
 
 
-__all__ = ["make_results_folder", "axis_label"]
+__all__ = ["make_results_folder", "axis_label",
+           "find_dominant_peak",
+           "combined_absorption_hotcarriers_gif", "static_multi_resonance_grid_gif",
+           "get_preset_geometry", "build_cluster", "get_polarizations"]
 
 
 def axis_label(v):
@@ -382,7 +385,7 @@ def make_results_folder(
     *,
     lmax: Optional[int] = None,
     eps_h: Optional[float] = None,
-    prefix: Union[str, Path] = "results",
+    prefix: Union[str, Path, None] = None,
     rtol: float = 1e-3,
     atol: float = 1e-3,
     include_timestamp: bool = False,
@@ -429,8 +432,19 @@ def make_results_folder(
     Np = len(bcms)
 
     # ----- base name by particle count -----
-    nname_map = {1: "monomer", 2: "dimer", 3: "trimer", 4: "tetramer"}
+    nname_map = {1: "monomer", 2: "dimer", 3: "trimer", 4: "tetramer",
+                 5: "pentamer", 6: "hexamer", 7: "heptamer"}
     nname = nname_map.get(Np, f"{Np}-mer")
+
+    # ----- auto-detect Results folder when prefix is None ----------------
+    if prefix is None:
+        _folder_map = {
+            1: "Monomer", 2: "Dimer", 3: "Trimer", 4: "Tetramer",
+            5: "Pentamer", 6: "Hexamer", 7: "Heptamer", 8: "Octahedron",
+        }
+        _cluster = _folder_map.get(Np, "N-mer")
+        _project_root = Path(__file__).parent.parent
+        prefix = _project_root / "Results" / "spherical_NP" / _cluster / "static_simulations"
 
     # ----- diameters -----
     diam = np.array([float(o.diameter) for o in bcms], dtype=float)
@@ -1555,6 +1569,37 @@ def absorption_gap_gif(
 # Optical-response dashboard
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def find_dominant_peak(x, y, prominence_frac=0.05):
+    """
+    Return the index and x-value of the highest-prominence peak in *y*.
+
+    Parameters
+    ----------
+    x : array-like
+        x-axis values (e.g. photon energy [eV]).
+    y : array-like
+        Signal to search (e.g. Q_abs).
+    prominence_frac : float
+        Minimum prominence threshold as a fraction of ``max(|y|)``.
+
+    Returns
+    -------
+    idx : int or None
+        Array index of the dominant peak, or ``None`` if no peak is found.
+    x_peak : float or None
+        Corresponding x-value, or ``None`` if no peak is found.
+    """
+    from scipy.signal import find_peaks as _find_peaks
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    threshold = prominence_frac * np.nanmax(np.abs(y))
+    peaks, props = _find_peaks(y, prominence=threshold)
+    if len(peaks) == 0:
+        return None, None
+    dominant = peaks[np.argmax(props['prominences'])]
+    return int(dominant), float(x[dominant])
+
+
 def label_peaks(ax, x, y, n_peaks=3, prominence_frac=0.05, color='steelblue', fontsize=8):
     """Annotate the top peaks on an axes with vertical lines and energy labels."""
     from scipy.signal import find_peaks
@@ -1689,15 +1734,22 @@ def plot_optical_dashboard(results, *, config=None, show=True):
         fig_i.savefig(outdir / fname, dpi=200, transparent=True)
         plt.close(fig_i)
 
-    # ── Geometry summary ──
-    with open(outdir / "geometry.txt", "w") as f:
-        f.write(f"N particles: {Np}\n")
-        for i, obj in enumerate(BCM_objects, start=1):
-            f.write(f"sphere{i}: label={obj.label}, D={obj.diameter:.3f} nm, "
-                    f"pos=({obj.position[0]:.3f}, {obj.position[1]:.3f}, {obj.position[2]:.3f}) nm, "
-                    f"lmax={obj.lmax}\n")
-        f.write(f"eps_h={eps_h}\n")
-        f.write(f"E0={efield.E0} V/nm, e_hat={efield.e_hat}, k_hat={efield.k_hat}\n")
+    # ── Geometry summary (.xyz — extended XYZ, readable by ASE / OVITO) ──
+    e = efield.e_hat;  k = efield.k_hat
+    comment = (
+        f"eps_h={eps_h} "
+        f"E0={efield.E0}_V/nm "
+        f"e_hat=\"{e[0]:.4f} {e[1]:.4f} {e[2]:.4f}\" "
+        f"k_hat=\"{k[0]:.4f} {k[1]:.4f} {k[2]:.4f}\" "
+        f"Properties=species:S:1:pos:R:3:diameter:R:1:lmax:I:1"
+    )
+    with open(outdir / "geometry.xyz", "w") as f:
+        f.write(f"{Np}\n{comment}\n")
+        for obj in BCM_objects:
+            symbol = obj.label.split()[0]          # first word (e.g. "Au", "Ag", "sphere1")
+            p = obj.position
+            f.write(f"{symbol}  {p[0]:.6f}  {p[1]:.6f}  {p[2]:.6f}"
+                    f"  {obj.diameter:.3f}  {obj.lmax}\n")
 
     print("All figures and data saved in:", outdir)
 
@@ -1966,10 +2018,10 @@ def compute_E2_maps_interior(
     if delta_nm is None:
         delta_nm = min(du, dv)
 
-    # shrink interior mask by one grid step so in-plane finite differences
-    # never cross the metal-vacuum interface (where dPhi/dn is discontinuous)
-    surface_shell = max(du, dv)
-    grad_mask = ~host_mask_from_xyz(Xg, Yg, Zg, BCM_objects, shell_nm=-surface_shell)
+    # shrink by one grid step so in-plane finite differences never cross the
+    # metal-vacuum interface (where the potential has a kink)
+    shell_nm   = max(du, dv)
+    grad_mask  = ~host_mask_from_xyz(Xg, Yg, Zg, BCM_objects, shell_nm=-shell_nm)
 
     Phi_0 = phi_all_points(pts, BCM_objects, lam_um).reshape(n, n)
     _, _, pts_p, *_ = _efield_plane_grid(p, o + delta_nm*nv, span_nm, n)
@@ -2105,3 +2157,1473 @@ def plot_efield_maps(results, *, plane=None, origin_nm=(0, 0, 0),
                            BCM_objects=BCM_objects, plane=plane, origin_nm=origin_nm)
 
 
+
+
+# === INTERACTIVE BUILDER (moved from interactive_builder.py) ===
+"""
+Interactive nanocluster geometry builder with real-time 3D visualization.
+
+This module provides an interactive widget-based interface for designing
+nanocluster geometries with live 3D visualization using Plotly.
+"""
+
+import numpy as np
+import plotly.graph_objects as go
+from ipywidgets import (
+    VBox, HBox, Button, Output,
+    IntSlider, FloatSlider, Dropdown, Label, Tab, FloatText, Checkbox
+)
+from IPython.display import display, clear_output
+from pathlib import Path
+
+import plytrons.bcm_sphere as bcm
+from plytrons.bcm_sphere import EField, BCMObject
+
+
+
+# =============================================================================
+# MATERIAL LIBRARY
+# =============================================================================
+MATERIALS = {
+    'Silver': {
+        'EF': 5.53,      # Fermi energy (eV)
+        'wp': 9.07,      # Plasma frequency (eV)
+        'vf': 1.39e6,    # Fermi velocity (m/s)
+        'gamma0': 0.060, # Damping
+        'eps_b': 4.18,   # Background permittivity
+        'color': '#C0C0C0'
+    },
+    'Gold': {
+        'EF': 5.53,
+        'wp': 9.03,
+        'vf': 1.40e6,
+        'gamma0': 0.070,
+        'eps_b': 9.84,
+        'color': '#FFD700'
+    },
+    'Copper': {
+        'EF': 7.0,
+        'wp': 8.8,
+        'vf': 1.57e6,
+        'gamma0': 0.027,
+        'eps_b': 1.0,
+        'color': '#B87333'
+    }
+}
+
+# Refractive-index presets for the surrounding medium
+MEDIA = {
+    'Vacuum / Air': 1.0,
+    'Water':        1.77,   # n=1.33  → eps = n²
+    'Glass (SiO₂)': 2.25,  # n=1.50
+    'TiO₂':         6.25,  # n=2.50
+}
+
+
+# =============================================================================
+# GEOMETRY PRESETS
+# =============================================================================
+def get_preset_geometry(preset_name, D, delta):
+    """
+    Generate preset nanocluster geometries.
+
+    Parameters
+    ----------
+    preset_name : str
+        Name of preset geometry
+    D : float
+        Diameter of spheres (nm)
+    delta : float
+        Gap between sphere surfaces (nm)
+
+    Returns
+    -------
+    list of np.ndarray
+        List of 3D positions for each particle
+    """
+    d_c = D + delta
+
+    if preset_name == 'Monomer':
+        return [np.array([0, 0, 0])]
+
+    elif preset_name == 'Dimer':
+        return [
+            np.array([0, d_c/2, 0]),
+            np.array([0, -d_c/2, 0])
+        ]
+
+    elif preset_name == 'Trimer':
+        return [
+            np.array([0, d_c/2, 0]),
+            np.array([0, -d_c/2, 0]),
+            np.array([0, 0, -(d_c/2)*np.sqrt(3)])
+        ]
+
+    elif preset_name in ('Tetramer', 'Tetramer (square)'):
+        # Square planar: 4 particles at corners of a square with edge d_c
+        return [
+            np.array([0,  d_c/2,  d_c/2]),
+            np.array([0,  d_c/2, -d_c/2]),
+            np.array([0, -d_c/2,  d_c/2]),
+            np.array([0, -d_c/2, -d_c/2]),
+        ]
+
+    elif preset_name == 'Tetramer (tetrahedron)':
+        # Regular tetrahedron: all 6 edges = d_c
+        # Vertices: (±1,±1,±1) with even permutations, scaled so edge = d_c
+        s = d_c / (2 * np.sqrt(2))
+        return [
+            np.array([ s,  s,  s]),
+            np.array([ s, -s, -s]),
+            np.array([-s,  s, -s]),
+            np.array([-s, -s,  s]),
+        ]
+
+    elif preset_name in ('Pentamer (planar)', 'Pentamer (ring)'):
+        N = 5
+        return [
+            np.array([
+                0,
+                (d_c/(2*np.sin(np.pi/N)))*np.cos(np.pi/2 + 2*np.pi/N*i),
+                (d_c/(2*np.sin(np.pi/N)))*np.sin(np.pi/2 + 2*np.pi/N*i)
+            ]) for i in range(N)
+        ]
+
+    elif preset_name == 'Pentamer (pyramid)':
+        # Square base (edge d_c) + apex, all lateral edges = d_c
+        h = d_c / np.sqrt(2)   # apex height above base so lateral edge = d_c
+        return [
+            np.array([0,  d_c/2,  d_c/2]),
+            np.array([0,  d_c/2, -d_c/2]),
+            np.array([0, -d_c/2,  d_c/2]),
+            np.array([0, -d_c/2, -d_c/2]),
+            np.array([h,  0,      0     ]),   # apex along x
+        ]
+
+    elif preset_name == 'Hexamer (ring)':
+        N = 6
+        return [
+            np.array([
+                0,
+                (d_c/(2*np.sin(np.pi/N)))*np.cos(np.pi/2 + 2*np.pi/N*i),
+                (d_c/(2*np.sin(np.pi/N)))*np.sin(np.pi/2 + 2*np.pi/N*i)
+            ]) for i in range(N)
+        ]
+
+    elif preset_name == 'Hexamer (bi-triangle)':
+        # Two equilateral triangles (edge d_c) stacked and rotated 60° — triangular antiprism
+        R = d_c / np.sqrt(3)    # circumradius of equilateral triangle with edge d_c
+        h = d_c / 2             # half-height between layers
+        bottom = [
+            np.array([0, R * np.cos(np.pi/2 + 2*np.pi/3*i),
+                         R * np.sin(np.pi/2 + 2*np.pi/3*i), ]) for i in range(3)
+        ]
+        top = [
+            np.array([0, R * np.cos(np.pi/2 + np.pi/3 + 2*np.pi/3*i),
+                         R * np.sin(np.pi/2 + np.pi/3 + 2*np.pi/3*i)]) for i in range(3)
+        ]
+        # Reorder as [x, y, z] with x being the stacking axis
+        bottom = [np.array([-h, p[1], p[2]]) for p in bottom]
+        top    = [np.array([ h, p[1], p[2]]) for p in top]
+        return bottom + top
+
+    elif preset_name == 'Heptamer (ring + center)':
+        N = 6
+        positions = [np.array([0, 0, 0])]  # center particle
+        positions.extend([
+            np.array([
+                0,
+                (d_c/(2*np.sin(np.pi/N)))*np.cos(np.pi/2 + 2*np.pi/N*i),
+                (d_c/(2*np.sin(np.pi/N)))*np.sin(np.pi/2 + 2*np.pi/N*i)
+            ]) for i in range(N)
+        ])
+        return positions
+
+    elif preset_name == 'Octahedron':
+        # Regular octahedron: all 12 edges = d_c
+        # 6 vertices along ±x, ±y, ±z at distance d_c/√2 from origin
+        a = d_c / np.sqrt(2)
+        return [
+            np.array([ a,  0,  0]),
+            np.array([-a,  0,  0]),
+            np.array([ 0,  a,  0]),
+            np.array([ 0, -a,  0]),
+            np.array([ 0,  0,  a]),
+            np.array([ 0,  0, -a]),
+        ]
+
+    elif preset_name == 'Satellite (1+6)':
+        # 1 central particle + 6 shell particles along ±x, ±y, ±z at distance d_c
+        return [
+            np.array([0,    0,    0   ]),   # core
+            np.array([d_c,  0,    0   ]),
+            np.array([-d_c, 0,    0   ]),
+            np.array([0,    d_c,  0   ]),
+            np.array([0,   -d_c,  0   ]),
+            np.array([0,    0,    d_c ]),
+            np.array([0,    0,   -d_c ]),
+        ]
+
+    return [np.array([0, 0, 0])]
+
+
+# =============================================================================
+# CLUSTER BUILDER  (returns BCMObject instances)
+# =============================================================================
+def build_cluster(structure, D, delta, lmax, eps_func, eps_h=1.0):
+    """
+    Build a list of BCMObject instances for standard nanocluster geometries.
+
+    All spheres are identical (diameter D, lmax, eps_func).  Every
+    nearest-neighbor centre-to-centre distance equals D + delta exactly.
+    All clusters lie in the **yz-plane** (x = 0 for every sphere).
+
+    Parameters
+    ----------
+    structure : int
+        Number of spheres.  Supported values:
+
+        * **2** — dimer, axis along y
+        * **3** — equilateral trimer in the yz-plane
+        * **4** — square planar in the yz-plane (edge = D + delta)
+        * **5** — regular pentagon in the yz-plane
+        * **7** — heptamer: 6-sphere hexagonal ring + 1 central sphere
+
+    D : float
+        Sphere diameter [nm].
+    delta : float
+        Surface-to-surface gap between nearest neighbours [nm].
+        Must be > 0.
+    lmax : int
+        Maximum spherical-harmonic order for each BCMObject.
+    eps_func : callable
+        Permittivity function ``eps(lam_um) -> complex``.
+    eps_h : float, optional
+        Host-medium permittivity (default 1.0, vacuum).
+
+    Returns
+    -------
+    list of BCMObject
+        Ready-to-use objects with positions verified for correct NN distance.
+
+    Raises
+    ------
+    ValueError
+        If ``structure`` is not in ``{2, 3, 4, 5, 7}``.
+    ValueError
+        If ``delta`` is not positive.
+
+    Notes
+    -----
+    Geometry derivations (d_c = D + delta):
+
+    * **Dimer (2):**  positions ``(0, ±d_c/2, 0)``.
+    * **Trimer (3):**  equilateral triangle with edge d_c;
+      circumradius ``R = d_c / √3``; vertices at
+      ``(0, R cos(π/2 + 2πk/3), R sin(π/2 + 2πk/3))`` for k = 0, 1, 2.
+    * **Tetramer (4):**  square with edge d_c;
+      vertices at ``(0, ±d_c/2, ±d_c/2)``.
+    * **Pentamer (5):**  regular pentagon with edge d_c;
+      circumradius ``R = d_c / (2 sin(π/5))``.
+    * **Heptamer (7):**  centre at origin + hexagonal ring with edge d_c;
+      circumradius ``R = d_c / (2 sin(π/6)) = d_c``; ring vertices at
+      ``(0, d_c cos(π/2 + 2πk/6), d_c sin(π/2 + 2πk/6))`` for k = 0…5.
+    """
+    _SUPPORTED = {2, 3, 4, 5, 7}
+    if structure not in _SUPPORTED:
+        raise ValueError(
+            f"structure={structure} is not supported. "
+            f"Choose from {sorted(_SUPPORTED)}."
+        )
+    if delta <= 0:
+        raise ValueError(f"delta must be positive; got {delta}.")
+
+    d_c = float(D) + float(delta)   # nearest-neighbour centre-to-centre distance
+
+    # ── Position tables ───────────────────────────────────────────────────
+    if structure == 2:
+        positions = [
+            np.array([0.0,  d_c / 2, 0.0]),
+            np.array([0.0, -d_c / 2, 0.0]),
+        ]
+
+    elif structure == 3:
+        # Equilateral triangle, edge = d_c.
+        # Circumradius: R = d_c / sqrt(3)
+        R = d_c / np.sqrt(3)
+        positions = [
+            np.array([0.0,
+                      R * np.cos(np.pi / 2 + 2 * np.pi / 3 * k),
+                      R * np.sin(np.pi / 2 + 2 * np.pi / 3 * k)])
+            for k in range(3)
+        ]
+
+    elif structure == 4:
+        # Square, edge = d_c.
+        h = d_c / 2
+        positions = [
+            np.array([0.0,  h,  h]),
+            np.array([0.0,  h, -h]),
+            np.array([0.0, -h,  h]),
+            np.array([0.0, -h, -h]),
+        ]
+
+    elif structure == 5:
+        # Regular pentagon, edge = d_c.
+        # Circumradius: R = d_c / (2 sin(π/5))
+        R = d_c / (2 * np.sin(np.pi / 5))
+        positions = [
+            np.array([0.0,
+                      R * np.cos(np.pi / 2 + 2 * np.pi / 5 * k),
+                      R * np.sin(np.pi / 2 + 2 * np.pi / 5 * k)])
+            for k in range(5)
+        ]
+
+    else:  # structure == 7
+        # Heptamer: centre + hexagonal ring, edge = d_c.
+        # Circumradius of regular hexagon with edge d_c: R = d_c
+        R = d_c
+        ring = [
+            np.array([0.0,
+                      R * np.cos(np.pi / 2 + 2 * np.pi / 6 * k),
+                      R * np.sin(np.pi / 2 + 2 * np.pi / 6 * k)])
+            for k in range(6)
+        ]
+        positions = [np.array([0.0, 0.0, 0.0])] + ring
+
+    # ── Sanity check: every NN pair has distance d_c ──────────────────────
+    # Build NN table: for each sphere find the minimum distance to any other.
+    pos_arr = np.array(positions)
+    for i, pi in enumerate(pos_arr):
+        dists = [np.linalg.norm(pi - pos_arr[j]) for j in range(len(positions)) if j != i]
+        nn_dist = min(dists)
+        if abs(nn_dist - d_c) > 1e-9:
+            raise RuntimeError(
+                f"build_cluster: internal geometry error for structure={structure}. "
+                f"Sphere {i} nearest-neighbour distance = {nn_dist:.6g} nm, "
+                f"expected {d_c:.6g} nm."
+            )
+
+    # ── Assemble BCMObject list ────────────────────────────────────────────
+    from plytrons.bcm_sphere import BCMObject as _BCMObject
+    return [
+        _BCMObject(
+            label=f'Sphere{i + 1}',
+            diameter=float(D),
+            lmax=int(lmax),
+            eps=eps_func,
+            position=pos,
+        )
+        for i, pos in enumerate(positions)
+    ]
+
+
+# =============================================================================
+# POLARIZATION PRESETS
+# =============================================================================
+def get_polarizations(structure):
+    """
+    Return the physically distinct (k_hat, e_hat) illumination tuples for
+    a given cluster geometry.
+
+    "Distinct" means that no two entries are related by a symmetry operation
+    of the cluster that maps the cluster onto itself — so running the full
+    set covers all inequivalent optical responses without redundancy.
+
+    Parameters
+    ----------
+    structure : int
+        Number of spheres.  Must be in {2, 3, 4, 5, 7}.
+
+    Returns
+    -------
+    list of tuple (k_hat, e_hat)
+        Each entry is a pair of unit-vector arrays (shape (3,), float64).
+        Both vectors are already normalised.
+
+    Raises
+    ------
+    ValueError
+        If ``structure`` is not in {2, 3, 4, 5, 7}.
+
+    Symmetry notes
+    --------------
+    All clusters lie in the **yz-plane** (x = 0).  The illumination
+    direction k and polarisation E are always perpendicular.
+
+    **Dimer (2) — C_{2v}, axis along y**
+        Two inequivalent channels:
+        * Longitudinal (E ∥ y): drives the bonding (bright) plasmon mode;
+          near-field concentrates in the gap.
+        * Transverse   (E ∥ z): drives the antibonding / transverse mode;
+          weak gap coupling.
+
+    **Equilateral trimer (3) — D_{3h}, yz-plane**
+        Three distinct channels:
+        * In-plane longitudinal (k ∥ x, E ∥ y): E lies along one
+          symmetry axis of the triangle.
+        * In-plane transverse   (k ∥ x, E ∥ z): E lies perpendicular
+          to that axis but still in-plane; inequivalent because the
+          triangle is not square.
+        * Out-of-plane          (k ∥ y, E ∥ x): E is normal to the
+          cluster plane; drives out-of-plane (dark/toroidal) modes.
+
+    **Square tetramer (4) — D_{4h}, yz-plane**
+        Same three distinct channels as the trimer.  The 4-fold in-plane
+        symmetry makes the two orthogonal in-plane directions (E ∥ y and
+        E ∥ z, both with k ∥ x) equivalent by a 90° rotation, **but** for
+        a square we keep both because the square has only C_4, so E ∥ face-
+        diagonal vs E ∥ edge are distinct.  Out-of-plane (E ∥ x) is the
+        third independent channel.
+
+    **Regular pentagon (5) — D_{5h}, yz-plane**
+        Same three channels as the trimer.  The 5-fold symmetry makes all
+        in-plane E directions related *within* each k direction, so k ∥ x
+        with E ∥ y and k ∥ x with E ∥ z are the only two in-plane
+        inequivalent choices; out-of-plane k ∥ y, E ∥ x is the third.
+
+    **Heptamer (7) — C_{6v}, yz-plane**
+        Two distinct channels:
+        * In-plane    (k ∥ x, E ∥ y): the 6-fold ring symmetry makes
+          all in-plane E orientations equivalent up to a rotation of the
+          cluster — a single representative suffices.
+        * Out-of-plane (k ∥ x, E ∥ z): E normal to the ring plane;
+          drives the dark out-of-plane mode.
+          Note: k ∥ x with E ∥ z is the same channel as k ∥ y with
+          E ∥ x after a 90° rotation about z, so only one entry is kept.
+    """
+    _SUPPORTED = {2, 3, 4, 5, 7}
+    if structure not in _SUPPORTED:
+        raise ValueError(
+            f"structure={structure} is not supported. "
+            f"Choose from {sorted(_SUPPORTED)}."
+        )
+
+    x = np.array([1.0, 0.0, 0.0])
+    y = np.array([0.0, 1.0, 0.0])
+    z = np.array([0.0, 0.0, 1.0])
+
+    if structure == 2:
+        # Dimer axis along y: longitudinal (E∥y) and transverse (E∥z)
+        return [
+            (x.copy(), y.copy()),   # longitudinal
+            (x.copy(), z.copy()),   # transverse
+        ]
+
+    elif structure in (3, 4, 5):
+        # Trimer / square tetramer / pentagon: all lie in yz-plane.
+        # Three inequivalent channels: two in-plane, one out-of-plane.
+        return [
+            (x.copy(), y.copy()),   # in-plane, E along y
+            (x.copy(), z.copy()),   # in-plane, E along z
+            (y.copy(), x.copy()),   # out-of-plane, E along x
+        ]
+
+    else:  # structure == 7
+        # Heptamer: 6-fold symmetry collapses all in-plane E directions;
+        # one in-plane and one out-of-plane channel suffice.
+        return [
+            (x.copy(), y.copy()),   # in-plane
+            (x.copy(), z.copy()),   # out-of-plane (E∥z normal to ring plane)
+        ]
+
+
+# =============================================================================
+# 3D VISUALIZATION HELPERS
+# =============================================================================
+def create_sphere_mesh(center, radius, resolution=20):
+    """Create mesh coordinates for a sphere."""
+    u = np.linspace(0, 2 * np.pi, resolution)
+    v = np.linspace(0, np.pi, resolution)
+    x = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+    y = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+    z = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+    return x, y, z
+
+
+def create_arrow(start, direction, length, color, name):
+    """Create 3D arrow with shaft and cone head."""
+    end = start + direction * length
+
+    # Arrow shaft
+    shaft = go.Scatter3d(
+        x=[start[0], end[0]],
+        y=[start[1], end[1]],
+        z=[start[2], end[2]],
+        mode='lines',
+        line=dict(color=color, width=8),
+        name=name,
+        showlegend=True,
+        hoverinfo='name'
+    )
+
+    # Arrow head (cone)
+    cone = go.Cone(
+        x=[end[0]], y=[end[1]], z=[end[2]],
+        u=[direction[0]], v=[direction[1]], w=[direction[2]],
+        colorscale=[[0, color], [1, color]],
+        showscale=False,
+        sizemode='absolute',
+        sizeref=length*0.2,
+        name=name,
+        showlegend=False,
+        hoverinfo='skip'
+    )
+
+    return [shaft, cone]
+
+
+# =============================================================================
+# INTERACTIVE BUILDER CLASS
+# =============================================================================
+class NanoclusterBuilder:
+    """
+    Interactive widget for designing nanocluster geometries.
+
+    Features:
+    - Real-time 3D visualization (inline or separate window)
+    - Preset geometries (monomer through heptamer)
+    - Individual particle control (position, size, material)
+    - Field vector visualization (k, E, H)
+    - Direct export to BCM objects
+
+    Parameters
+    ----------
+    display_mode : str, optional
+        How to display plots: 'inline' (in notebook), 'browser' (separate window),
+        or 'auto' (try browser, fall back to inline). Default: 'inline'
+
+    Examples
+    --------
+    >>> builder = NanoclusterBuilder(display_mode='inline')
+    >>> # Adjust parameters in the GUI
+    >>> BCM_objects = builder.export_bcm_objects(eps_drude, lmax=10)
+    >>> efield = builder.export_efield()
+    """
+
+    def __init__(self, display_mode='inline'):
+        self.display_mode = display_mode  # 'inline', 'browser', or 'auto'
+        self.output = Output()
+        self.particle_widgets = []
+        self.current_positions = []
+        self.current_diameters = []
+        self.current_materials = []
+        self._updating_from_preset = False  # Flag to prevent preset->custom switching
+
+        # Global parameters
+        self.preset_dropdown = Dropdown(
+            options=[
+                'Custom',
+                # ── Planar / 2-D ──────────────────────────────
+                'Monomer',
+                'Dimer',
+                'Trimer',
+                'Tetramer (square)',
+                'Pentamer (ring)',
+                'Hexamer (ring)',
+                'Heptamer (ring + center)',
+                # ── 3-D ───────────────────────────────────────
+                'Tetramer (tetrahedron)',
+                'Pentamer (pyramid)',
+                'Hexamer (bi-triangle)',
+                'Octahedron',
+                'Satellite (1+6)',
+            ],
+            value='Dimer',
+            description='Preset:',
+            style={'description_width': '100px'}
+        )
+
+        self.n_particles = IntSlider(
+            value=2, min=1, max=10, step=1,
+            description='# Particles:',
+            style={'description_width': '100px'}
+        )
+
+        self.default_diameter = FloatSlider(
+            value=5.0, min=1.0, max=50.0, step=0.5,
+            description='Default D (nm):',
+            style={'description_width': '100px'}
+        )
+
+        self.gap = FloatSlider(
+            value=0.5, min=0.1, max=5.0, step=0.1,
+            description='Gap (nm):',
+            style={'description_width': '100px'}
+        )
+
+        self.default_material = Dropdown(
+            options=list(MATERIALS.keys()),
+            value='Silver',
+            description='Default Material:',
+            style={'description_width': '100px'}
+        )
+
+        self.medium_dropdown = Dropdown(
+            options=list(MEDIA.keys()),
+            value='Vacuum / Air',
+            description='Medium (εₕ):',
+            style={'description_width': '100px'}
+        )
+
+        self.model_dropdown = Dropdown(
+            options=['PWA', 'Nordlander', 'Bulk'],
+            value='PWA',
+            description='ε model:',
+            style={'description_width': '100px'}
+        )
+
+        # Rendering quality
+        self.sphere_resolution = IntSlider(
+            value=25, min=10, max=50, step=5,
+            description='Quality:',
+            style={'description_width': '100px'},
+            tooltip='Higher = better looking but slower'
+        )
+
+        # Field parameters - k-vector (propagation direction)
+        self.k_x = FloatSlider(value=1, min=-1, max=1, step=0.1, description='k_x:',
+                               style={'description_width': '50px'})
+        self.k_y = FloatSlider(value=0, min=-1, max=1, step=0.1, description='k_y:',
+                               style={'description_width': '50px'})
+        self.k_z = FloatSlider(value=0, min=-1, max=1, step=0.1, description='k_z:',
+                               style={'description_width': '50px'})
+
+        # Polarization angle (rotation of E-vector in plane perpendicular to k)
+        self.pol_angle = FloatSlider(
+            value=90, min=0, max=360, step=5,
+            description='Pol. angle (°):',
+            style={'description_width': '100px'},
+            tooltip='Rotation angle of E-vector in plane perpendicular to k'
+        )
+
+        # Display options
+        self.show_field = Checkbox(value=True, description='Show E/H field')
+        self.show_centers = Checkbox(value=True, description='Show centers')
+
+        # Update button
+        self.update_btn = Button(
+            description='🔄 Update Geometry',
+            button_style='primary',
+            tooltip='Click to update 3D visualization'
+        )
+        self.update_btn.on_click(self.on_update_click)
+
+        # Observers for auto-update on preset changes
+        self.preset_dropdown.observe(self.on_preset_change, names='value')
+        self.n_particles.observe(self.on_n_particles_change, names='value')
+        self.gap.observe(self.on_gap_change, names='value')
+        self.default_diameter.observe(self.on_diameter_change, names='value')
+        self.default_material.observe(self.on_material_change, names='value')
+
+        # Initialize UI
+        self.setup_ui()
+        self.update_plot()
+
+    def on_preset_change(self, change):
+        """Handle preset geometry selection."""
+        if change['new'] != 'Custom':
+            self._updating_from_preset = True  # Set flag
+            D = self.default_diameter.value
+            delta = self.gap.value
+            positions = get_preset_geometry(change['new'], D, delta)
+            self.n_particles.value = len(positions)
+            self.current_positions = positions
+            # Update diameters to match default
+            self.current_diameters = [D] * len(positions)
+            # Update materials to default
+            self.current_materials = [self.default_material.value] * len(positions)
+            self.update_particle_widgets()
+            self.update_plot()
+            self._updating_from_preset = False  # Clear flag
+
+    def on_n_particles_change(self, change):
+        """Handle change in number of particles."""
+        # Only switch to Custom if not triggered by preset selection
+        if not self._updating_from_preset:
+            self.preset_dropdown.value = 'Custom'
+        self.setup_particle_widgets()
+
+    def on_gap_change(self, change):
+        """Handle gap change for preset geometries."""
+        if self.preset_dropdown.value != 'Custom':
+            self.on_preset_change({'new': self.preset_dropdown.value})
+
+    def on_diameter_change(self, change):
+        """Handle default diameter change - update all particles."""
+        new_diameter = change['new']
+        # Update all current diameters
+        self.current_diameters = [new_diameter] * len(self.current_positions)
+        # Rebuild widgets with new diameters
+        self.setup_particle_widgets()
+
+    def on_material_change(self, change):
+        """Handle default material change - update all particles."""
+        new_material = change['new']
+        # Update all current materials
+        self.current_materials = [new_material] * len(self.current_positions)
+        # Rebuild widgets with new materials and refresh the tab
+        self.setup_particle_widgets()
+        self.refresh_particles_tab()
+
+    def setup_particle_widgets(self):
+        """Create widgets for individual particle parameters."""
+        n = self.n_particles.value
+
+        # Initialize with current or default values
+        if len(self.current_positions) != n:
+            self.current_positions = [np.array([0.0, i*6.0, 0.0]) for i in range(n)]
+            self.current_diameters = [self.default_diameter.value] * n
+            self.current_materials = [self.default_material.value] * n
+
+        self.particle_widgets = []
+
+        for i in range(n):
+            pos = self.current_positions[i] if i < len(self.current_positions) else np.array([0.0, i*6.0, 0.0])
+            diam = self.current_diameters[i] if i < len(self.current_diameters) else self.default_diameter.value
+            mat = self.current_materials[i] if i < len(self.current_materials) else self.default_material.value
+
+            particle_box = VBox([
+                Label(f'━━ Particle {i+1} ━━', layout={'width': '150px'}),
+                FloatText(value=pos[0], description='x (nm):', step=0.1,
+                         style={'description_width': '60px'}),
+                FloatText(value=pos[1], description='y (nm):', step=0.1,
+                         style={'description_width': '60px'}),
+                FloatText(value=pos[2], description='z (nm):', step=0.1,
+                         style={'description_width': '60px'}),
+                FloatText(value=diam, description='D (nm):', step=0.5,
+                         style={'description_width': '60px'}),
+                Dropdown(options=list(MATERIALS.keys()), value=mat,
+                        description='Material:',
+                        style={'description_width': '60px'})
+            ])
+            self.particle_widgets.append(particle_box)
+
+    def update_particle_widgets(self):
+        """Update particle widget values from current positions."""
+        self.setup_particle_widgets()
+        # Refresh the particles tab
+        self.refresh_particles_tab()
+
+    def refresh_particles_tab(self):
+        """Refresh the particles tab with updated widgets."""
+        if hasattr(self, 'main_tab'):
+            # Rebuild particles tab
+            particles_tab = VBox([
+                HBox(self.particle_widgets[:5]) if len(self.particle_widgets) > 1 else VBox(self.particle_widgets),
+                HBox(self.particle_widgets[5:]) if len(self.particle_widgets) > 5 else VBox([])
+            ])
+
+            # Update the tab (keep other tabs intact)
+            children = list(self.main_tab.children)
+            children[1] = particles_tab  # Replace particles tab (index 1)
+            self.main_tab.children = children
+
+    def setup_ui(self):
+        """Setup the complete user interface."""
+        self.setup_particle_widgets()
+
+        # Particles tab with horizontal layout for up to 5 particles
+        particles_tab = VBox([
+            HBox(self.particle_widgets[:5]) if len(self.particle_widgets) > 1 else VBox(self.particle_widgets),
+            HBox(self.particle_widgets[5:]) if len(self.particle_widgets) > 5 else VBox([])
+        ])
+
+        # Global parameters tab
+        global_tab = VBox([
+            Label('━━━━━ Geometry Presets ━━━━━'),
+            self.preset_dropdown,
+            self.n_particles,
+            self.default_diameter,
+            self.gap,
+            self.default_material,
+            Label('━━━━━ Surrounding Medium ━━━━━'),
+            self.medium_dropdown,
+            Label('━━━━━ Dielectric Model ━━━━━'),
+            self.model_dropdown,
+            Label('━━━━━ Rendering ━━━━━'),
+            self.sphere_resolution
+        ])
+
+        # Field and visualization tab
+        field_tab = VBox([
+            Label('━━━━━ Incident Wavevector k (propagation) ━━━━━'),
+            HBox([self.k_x, self.k_y, self.k_z]),
+            Label('━━━━━ Polarization (E-vector rotation) ━━━━━'),
+            self.pol_angle,
+            Label('   E-vector is computed perpendicular to k'),
+            Label('   Angle rotates E in plane ⊥ k'),
+            Label('━━━━━ Display Options ━━━━━'),
+            self.show_field,
+            self.show_centers
+        ])
+
+        # Create tabs (store reference for later updates)
+        self.main_tab = Tab()
+        self.main_tab.children = [global_tab, particles_tab, field_tab]
+        self.main_tab.set_title(0, '⚙️ Global')
+        self.main_tab.set_title(1, '🔘 Particles')
+        self.main_tab.set_title(2, '📡 Incident EM wave')
+
+        # Main layout - controls above, output below
+        controls = VBox([
+            Label('🔬 Interactive Nanocluster Builder',
+                  layout={'width': '100%'}),
+            self.main_tab,
+            self.update_btn
+        ])
+
+        # Stack vertically instead of horizontally
+        display(VBox([controls, self.output]))
+
+    def on_update_click(self, b):
+        """Handle update button click."""
+        self.update_plot()
+
+    def get_current_parameters(self):
+        """Extract current parameter values from widgets."""
+        n = self.n_particles.value
+        positions, diameters, materials = [], [], []
+
+        for i in range(n):
+            if i < len(self.particle_widgets):
+                widgets = self.particle_widgets[i].children
+                x = widgets[1].value
+                y = widgets[2].value
+                z = widgets[3].value
+                d = widgets[4].value
+                mat = widgets[5].value
+
+                positions.append(np.array([x, y, z]))
+                diameters.append(d)
+                materials.append(mat)
+
+        self.current_positions = positions
+        self.current_diameters = diameters
+        self.current_materials = materials
+
+        return positions, diameters, materials
+
+    def check_overlaps(self, positions, diameters):
+        """
+        Check for overlapping nanoparticles.
+
+        Returns
+        -------
+        list of tuples
+            List of (i, j, overlap_distance) for overlapping pairs
+        """
+        overlaps = []
+        n = len(positions)
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Distance between centers
+                distance = np.linalg.norm(positions[i] - positions[j])
+
+                # Sum of radii
+                min_distance = (diameters[i] + diameters[j]) / 2.0
+
+                # Check for overlap (with small tolerance for surface contact)
+                if distance < min_distance - 0.01:  # 0.01 nm tolerance
+                    overlap = min_distance - distance
+                    overlaps.append((i, j, overlap))
+
+        return overlaps
+
+    def compute_e_vector(self, k_vec, angle_degrees):
+        """
+        Compute E-vector from k-vector and polarization angle.
+
+        The E-vector is constructed in the plane perpendicular to k by rotating
+        around k by the specified angle.
+
+        Parameters
+        ----------
+        k_vec : array-like
+            Normalized k-vector (propagation direction)
+        angle_degrees : float
+            Polarization angle in degrees (0-360)
+
+        Returns
+        -------
+        np.ndarray
+            Normalized E-vector perpendicular to k
+        """
+        # Convert angle to radians
+        theta = np.radians(angle_degrees)
+
+        # Find two orthonormal vectors perpendicular to k
+        # First perpendicular vector: choose based on which component of k is smallest
+        k_normalized = bcm.v_normalize(k_vec)
+
+        if abs(k_normalized[2]) < 0.9:
+            # k is not close to z-axis, use z as reference
+            v1 = np.cross(k_normalized, [0, 0, 1])
+        else:
+            # k is close to z-axis, use x as reference
+            v1 = np.cross(k_normalized, [1, 0, 0])
+
+        v1 = bcm.v_normalize(v1)
+
+        # Second perpendicular vector: cross product of k and v1
+        v2 = np.cross(k_normalized, v1)
+        v2 = bcm.v_normalize(v2)
+
+        # Construct E-vector by rotating in the v1-v2 plane
+        e_vec = np.cos(theta) * v1 + np.sin(theta) * v2
+
+        return bcm.v_normalize(e_vec)
+
+    def update_plot(self):
+        """Update the 3D visualization in a separate browser window."""
+        positions, diameters, materials = self.get_current_parameters()
+
+        # Compute k-vector (propagation direction)
+        k_vec = bcm.v_normalize([self.k_x.value, self.k_y.value, self.k_z.value])
+
+        # Compute E-vector from polarization angle (always perpendicular to k)
+        e_vec = self.compute_e_vector(k_vec, self.pol_angle.value)
+
+        # Check for overlaps
+        overlaps = self.check_overlaps(positions, diameters)
+
+        with self.output:
+            clear_output(wait=True)
+
+            # Display overlap warnings
+            if overlaps:
+                print("\n" + "⚠️ " * 35)
+                print("❌ WARNINGS DETECTED!")
+                print("⚠️ " * 35 + "\n")
+                print("🔴 NANOPARTICLE OVERLAP:")
+                print("   The following particle pairs are overlapping:")
+                print("   (This will cause physics simulations to fail!)\n")
+                for i, j, overlap in overlaps:
+                    print(f"   • Particle {i+1} ↔ Particle {j+1}: overlap = {overlap:.3f} nm")
+                print()
+                print("⚠️ " * 35 + "\n")
+
+            # Create Plotly figure
+            fig = go.Figure()
+
+            # Create list of overlapping particle indices
+            overlapping_indices = set()
+            for i, j, _ in overlaps:
+                overlapping_indices.add(i)
+                overlapping_indices.add(j)
+
+            # Add spheres
+            resolution = self.sphere_resolution.value
+            for i, (pos, diam, mat) in enumerate(zip(positions, diameters, materials), 1):
+                radius = diam / 2.0
+                x, y, z = create_sphere_mesh(pos, radius, resolution)
+
+                # Always use material color
+                color = MATERIALS[mat]['color']
+
+                # Add warning prefix if overlapping
+                if (i - 1) in overlapping_indices:
+                    name_prefix = '⚠️ '
+                    hover_warning = '<br><b>⚠️ OVERLAPPING!</b>'
+                    # Add red glow effect by adjusting lighting
+                    ambient = 0.8  # Brighter for overlapping
+                    diffuse = 0.5
+                else:
+                    name_prefix = ''
+                    hover_warning = ''
+                    ambient = 0.6
+                    diffuse = 0.8
+
+                fig.add_trace(go.Surface(
+                    x=x, y=y, z=z,
+                    colorscale=[[0, color], [1, color]],
+                    showscale=False,
+                    name=f'{name_prefix}{mat} #{i}',
+                    hovertemplate=(
+                        f'<b>{mat} Sphere #{i}</b><br>'
+                        f'Position: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) nm<br>'
+                        f'Diameter: {diam:.2f} nm{hover_warning}<br>'
+                        '<extra></extra>'
+                    ),
+                    lighting=dict(ambient=ambient, diffuse=diffuse, specular=0.4, roughness=0.3),
+                    lightposition=dict(x=100, y=200, z=150)
+                ))
+
+                # Add particle number label - place at sphere center for visibility
+                fig.add_trace(go.Scatter3d(
+                    x=[pos[0]],
+                    y=[pos[1]],
+                    z=[pos[2]],
+                    mode='text',
+                    text=[f'<b>#{i}</b>'],
+                    textfont=dict(
+                        size=18,
+                        color='white',
+                        family='Arial Black'
+                    ),
+                    textposition='middle center',
+                    showlegend=False,
+                    hoverinfo='skip'
+                ))
+
+                # Add center markers
+                if self.show_centers.value:
+                    # Use red color for overlapping particles
+                    center_color = 'red' if (i - 1) in overlapping_indices else 'black'
+                    center_size = 8 if (i - 1) in overlapping_indices else 4
+                    fig.add_trace(go.Scatter3d(
+                        x=[pos[0]], y=[pos[1]], z=[pos[2]],
+                        mode='markers',
+                        marker=dict(size=center_size, color=center_color, symbol='x' if (i - 1) in overlapping_indices else 'diamond'),
+                        name=f'Center {i}',
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ))
+
+            # Add field vectors
+            arrow_length_total = 0
+            if self.show_field.value:
+                pos_array = np.array(positions)
+                radii_array = np.array(diameters) / 2.0
+
+                mins = pos_array.min(axis=0) - radii_array.max()
+                maxs = pos_array.max(axis=0) + radii_array.max()
+
+                # Place arrows at corner with proper clearance
+                scene_span = np.max(maxs - mins)
+                arrow_length = 0.28 * scene_span
+                arrow_length_total = arrow_length  # Store for scene bounds adjustment
+
+                # Position at corner with clearance
+                arrow_origin = np.array([mins[0], maxs[1], mins[2]])
+
+                # k vector (red)
+                for arrow in create_arrow(arrow_origin, k_vec, arrow_length, 'red', 'k-vector'):
+                    fig.add_trace(arrow)
+
+                # E vector (blue)
+                E_hat = e_vec / np.linalg.norm(e_vec)
+                for arrow in create_arrow(arrow_origin, E_hat, arrow_length*0.85, 'blue', 'E-vector'):
+                    fig.add_trace(arrow)
+
+                # H vector (green)
+                H_hat = np.cross(k_vec, E_hat)
+                for arrow in create_arrow(arrow_origin, H_hat, arrow_length*0.85, 'green', 'H-vector'):
+                    fig.add_trace(arrow)
+
+            # Layout - ensure equal aspect ratio for spherical appearance
+            pos_array = np.array(positions)
+            radii_array = np.array(diameters) / 2.0
+
+            # Calculate bounding box with equal padding
+            center = pos_array.mean(axis=0)
+            max_extent = max(
+                (pos_array[:, 0].max() - pos_array[:, 0].min()),
+                (pos_array[:, 1].max() - pos_array[:, 1].min()),
+                (pos_array[:, 2].max() - pos_array[:, 2].min())
+            ) + 2 * radii_array.max()
+
+            # Make cubic scene with equal ranges
+            # Add extra space if arrows are shown
+            arrow_padding = arrow_length_total * 1.2 if self.show_field.value and arrow_length_total > 0 else 0
+            half_range = max_extent * 0.65 + arrow_padding
+            x_range = [center[0] - half_range, center[0] + half_range]
+            y_range = [center[1] - half_range, center[1] + half_range]
+            z_range = [center[2] - half_range, center[2] + half_range]
+
+            # Update title with overlap warning if needed
+            if overlaps:
+                title_text = f'<b>⚠️ Nanocluster Geometry (N={len(positions)}) - OVERLAP DETECTED!</b>'
+                title_color = 'red'
+            else:
+                title_text = f'<b>Nanocluster Geometry (N={len(positions)}) ✓</b>'
+                title_color = 'black'
+
+            fig.update_layout(
+                title=dict(
+                    text=title_text,
+                    x=0.5,
+                    xanchor='center',
+                    font=dict(size=18, color=title_color)
+                ),
+                scene=dict(
+                    xaxis=dict(title='x (nm)', range=x_range,
+                              backgroundcolor="rgb(245, 245, 250)",
+                              gridcolor="white", gridwidth=2),
+                    yaxis=dict(title='y (nm)', range=y_range,
+                              backgroundcolor="rgb(245, 245, 250)",
+                              gridcolor="white", gridwidth=2),
+                    zaxis=dict(title='z (nm)', range=z_range,
+                              backgroundcolor="rgb(245, 245, 250)",
+                              gridcolor="white", gridwidth=2),
+                    aspectmode='cube',  # Force equal aspect ratio
+                    aspectratio=dict(x=1, y=1, z=1),  # Explicit 1:1:1 ratio
+                    camera=dict(eye=dict(x=1.5, y=1.5, z=1.3))
+                ),
+                showlegend=True,
+                legend=dict(x=0.02, y=0.98, bgcolor='rgba(255,255,255,0.8)'),
+                hovermode='closest',
+                width=1000,
+                height=800
+            )
+
+            # Show the figure based on display mode
+            if self.display_mode == 'inline':
+                # Display inline in notebook with full interactivity
+                fig.show()
+            elif self.display_mode == 'browser':
+                # Try to open in browser
+                try:
+                    fig.show(renderer='browser')
+                except Exception as e:
+                    print(f"⚠️  Could not open browser: {e}")
+                    print("   Displaying inline instead...")
+                    fig.show()
+            else:  # 'auto'
+                # Try browser first, fall back to inline
+                try:
+                    fig.show(renderer='browser')
+                except Exception:
+                    fig.show()
+
+            # Print summary
+            print("\n" + "="*70)
+            print("NANOCLUSTER CONFIGURATION SUMMARY")
+            print("="*70)
+            print(f"Number of particles: {len(positions)}")
+
+            # Overlap status
+            if overlaps:
+                print(f"\n⚠️  OVERLAP STATUS: ❌ {len(overlaps)} overlap(s) detected!")
+                print("   ⚠️  Physics simulations will FAIL with overlapping particles!")
+            else:
+                print(f"\n✓  OVERLAP STATUS: ✅ No overlaps detected - geometry is valid!")
+
+            print(f"\nIncident field:")
+            print(f"  k-vector (propagation):     [{k_vec[0]:.3f}, {k_vec[1]:.3f}, {k_vec[2]:.3f}]")
+            print(f"  Polarization angle:         {self.pol_angle.value:.1f}°")
+            print(f"  E-vector (polarization):    [{e_vec[0]:.3f}, {e_vec[1]:.3f}, {e_vec[2]:.3f}]")
+            print(f"  H-vector (k × E):           [{np.cross(k_vec, e_vec)[0]:.3f}, {np.cross(k_vec, e_vec)[1]:.3f}, {np.cross(k_vec, e_vec)[2]:.3f}]")
+            print(f"  Verification: k · E = {np.dot(k_vec, e_vec):.6f} (should be ~0)")
+            print(f"\nParticles:")
+            for i, (pos, diam, mat) in enumerate(zip(positions, diameters, materials), 1):
+                print(f"  {i}. {mat:12s} D={diam:5.1f} nm  "
+                      f"pos=({pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f}) nm")
+            print("="*70)
+            if self.display_mode == 'inline':
+                print("\n💡 Interactive 3D plot displayed above (inline mode)")
+            else:
+                print("\n💡 Interactive 3D plot opened")
+            print("   • Drag to rotate  • Scroll to zoom  • Shift+drag to pan")
+            print()
+
+    def export_bcm_objects(self, eps_drude, lmax=10):
+        """
+        Export current configuration as BCM_objects list.
+
+        Parameters
+        ----------
+        eps_drude : callable
+            Dielectric function
+        lmax : int
+            Maximum spherical harmonic index
+
+        Returns
+        -------
+        list of BCMObject
+            Ready to use in BCM simulations
+        """
+        positions, diameters, materials = self.get_current_parameters()
+
+        BCM_objects = []
+        for i, (pos, diam, mat) in enumerate(zip(positions, diameters, materials), 1):
+            obj = BCMObject(
+                label=f'Sphere{i}_{mat}',
+                diameter=diam,
+                lmax=lmax,
+                eps=eps_drude,
+                position=pos
+            )
+            BCM_objects.append(obj)
+
+        return BCM_objects
+
+    def export_efield(self, E0=1):
+        """
+        Export current EField configuration.
+
+        Parameters
+        ----------
+        E0 : float
+            Electric field amplitude (V/nm)
+
+        Returns
+        -------
+        EField
+            Ready to use in BCM simulations
+        """
+        k_vec = bcm.v_normalize([self.k_x.value, self.k_y.value, self.k_z.value])
+        e_vec = self.compute_e_vector(k_vec, self.pol_angle.value)
+
+        return EField(E0=E0, k_hat=k_vec, e_hat=e_vec)
+
+
+def combined_absorption_hotcarriers_gif(
+    energy_eV: np.ndarray,
+    Qabs_frames: list,
+    hv_lines_per_delta: list,
+    Te_tau_frames: list,
+    Th_tau_frames: list,
+    Te_raw_frames: list,
+    Th_raw_frames: list,
+    e_states,
+    EF: float,
+    D: float,
+    hv_frames: list,
+    gap_values_nm: np.ndarray,
+    tau_fs: float,
+    dE_factor: float,
+    out_path,
+    title_prefix: str = "",
+    fps: int = 1,
+):
+    """
+    Build a GIF where each frame is a 1x2 grid:
+      [ Absorption vs hv ]  |  [ Hot-carrier distribution ]
+
+    Each frame corresponds to one gap value Delta at a fixed lifetime tau.
+    """
+    import imageio.v2 as imageio
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    E_all = np.concatenate([es.Eb[es.Eb != 0] for es in e_states]).real
+    n_levels = len(E_all)
+    if any(len(np.asarray(arr)) != n_levels for arr in Te_tau_frames):
+        raise ValueError("Length mismatch between Te_tau_frames and E_all.")
+    if any(len(np.asarray(arr)) != n_levels for arr in Th_tau_frames):
+        raise ValueError("Length mismatch between Th_tau_frames and E_all.")
+
+    to_ps = 1000.0   # fs -> ps
+    dt    = 1.0 / max(fps, 1)
+
+    with imageio.get_writer(out_path, mode="I", duration=dt) as writer:
+        for k, gap_nm in enumerate(gap_values_nm):
+            gap_nm = float(gap_nm)
+            hv     = float(hv_frames[k]) if k < len(hv_frames) else 0.0
+            if hv <= 0.0:
+                hv_pos = [h for h in hv_frames if h > 0]
+                hv     = float(np.mean(hv_pos)) if hv_pos else 1e-6
+
+            Te     = np.asarray(Te_tau_frames[k], float) / 1000.0
+            Th     = np.asarray(Th_tau_frames[k], float) / 1000.0
+            Te_raw = np.asarray(Te_raw_frames[k], float)
+            Th_raw = np.asarray(Th_raw_frames[k], float)
+
+            x, Te_x, Th_x = convert_raw_hot(Te, Th, E_all, dE_factor)
+            scale  = to_ps / hv
+            Te_x  *= scale
+            Th_x  *= scale
+
+            mask_e = (x >= EF) & (x <= EF + gap_nm)
+            mask_h = (x <= EF) & (x >= EF - gap_nm)
+
+            Qabs     = np.asarray(Qabs_frames[k], float)
+            hv_lines = hv_lines_per_delta[k]
+
+            fig, (ax_abs, ax_hc) = plt.subplots(1, 2, figsize=(13, 4.5))
+
+            # -- Left: Absorption --
+            ax_abs.plot(energy_eV, Qabs, 'k')
+            for hv_line in hv_lines:
+                ax_abs.axvline(hv_line, ls=':', lw=0.8, color='gray', alpha=0.6)
+            ax_abs.axvline(hv, ls='--', lw=1.2, color='red', alpha=0.95,
+                           label=r'resonance $h\nu$')
+            ax_abs.set_xlabel('Photon energy (eV)')
+            ax_abs.set_ylabel('Absorption efficiency')
+            ax_abs.set_title(rf'Absorption · $\Delta={gap_nm:.2f}$ nm')
+            ax_abs.grid(True, ls=':')
+            ax_abs.legend(loc='upper right')
+
+            # -- Right: Hot carriers --
+            ax2 = ax_hc.twinx()
+            ax_hc.fill_between((x - EF)[mask_e], Te_x[mask_e],
+                               color='r', alpha=0.38, label='Electrons (dens.)')
+            ax_hc.fill_between((x - EF)[mask_h], Th_x[mask_h],
+                               color='b', alpha=0.38, label='Holes (dens.)')
+
+            bar_w = 2.0e-2
+            ax2.bar(E_all - EF, Te_raw * to_ps, width=bar_w,
+                    color='firebrick', alpha=0.9, label='Electrons')
+            ax2.bar(E_all - EF, Th_raw * to_ps, width=bar_w,
+                    color='royalblue', alpha=0.9, label='Holes')
+
+            ax_hc.axvline(0.0,  ls='--', lw=1,   color='k',    alpha=0.5)
+            ax_hc.axvline(+hv,  ls='--', lw=1,   color='gray', alpha=0.6)
+            ax_hc.axvline(-hv,  ls='--', lw=1,   color='gray', alpha=0.6)
+            ax_hc.set_xlim(-gap_nm, +gap_nm)
+            ax_hc.set_xlabel('Hot carrier energy relative to Fermi level (eV)')
+            ax_hc.set_ylabel(
+                r'Rate density $[10^{-3}\,\mathrm{eV}^{-1}\,\mathrm{ps}^{-1}\,\mathrm{nm}^{-3}]$')
+            ax2.set_ylabel(r'Rate per particle $[\mathrm{ps}^{-1}]$')
+            ax_hc.set_ylim(0.0, 1.05 * max(Te_x[mask_e].max(initial=0.0),
+                                            Th_x[mask_h].max(initial=0.0)))
+            ax2.set_ylim(0.0, 3.0 * to_ps * max(Te_raw.max(initial=0.0),
+                                                  Th_raw.max(initial=0.0)))
+            h1, l1 = ax_hc.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
+            ax_hc.legend(h1 + h2, l1 + l2, loc='upper right')
+
+            fig.suptitle(
+                rf'{title_prefix}'
+                rf'\n$\Delta={gap_nm:.2f}\,\mathrm{{nm}},\ h\nu={hv:.2f}\,\mathrm{{eV}},'
+                rf'\ \tau={tau_fs/1000:.2f}\,\mathrm{{ps}}$'
+            )
+            fig.tight_layout(rect=[0, 0, 1, 0.92])
+            fig.canvas.draw()
+            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            writer.append_data(frame)
+            plt.close(fig)
+
+
+def static_multi_resonance_grid_gif(
+    energy_eV: np.ndarray,
+    Qabs_frames: list,
+    hv_lines_per_delta: list,
+    resonances_data: list,
+    e_states,
+    EF: float,
+    gap_values_nm: np.ndarray,
+    tau_fs: float,
+    dE_factor: float,
+    out_path,
+    title_prefix: str = "",
+    fps: int = 1,
+):
+    """
+    Build a GIF with one absorption panel + up to 3 hot-carrier distributions
+    (one per tracked resonance) for each gap step Delta.
+    """
+    import imageio.v2 as imageio
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not resonances_data:
+        return
+
+    resonances_data  = resonances_data[:3]   # at most 3 panels
+    hv_static_list   = [res["center_eV"] for res in resonances_data]
+    n_res            = len(resonances_data)
+    colors_static    = ["tab:red", "tab:blue", "tab:green"]
+
+    E_all  = np.concatenate([es.Eb[es.Eb != 0] for es in e_states]).real
+    to_ps  = 1000.0   # fs -> ps
+    dt     = 1.0 / max(fps, 1)
+
+    with imageio.get_writer(out_path, mode="I", duration=dt) as writer:
+        for k, gap_nm in enumerate(gap_values_nm):
+            gap_nm = float(gap_nm)
+
+            fig, axes = plt.subplots(n_res + 1, 1,
+                                     figsize=(8, 3.0 * (n_res + 1)),
+                                     sharex=True)
+            if n_res == 1:
+                axes = [axes]
+            ax_abs  = axes[0]
+            ax_list = axes[1:]
+
+            # -- Absorption panel --
+            Qabs        = np.asarray(Qabs_frames[k], float)
+            hv_lines_dyn = hv_lines_per_delta[k]
+
+            ax_abs.plot(energy_eV, Qabs, "k")
+            for hv_line in hv_lines_dyn:
+                ax_abs.axvline(hv_line, ls=":", lw=0.8, color="gray", alpha=0.6)
+            for i, hv_static in enumerate(hv_static_list):
+                ax_abs.axvline(hv_static, ls="--", lw=1.4,
+                               color=colors_static[i % len(colors_static)],
+                               alpha=0.9,
+                               label=rf"res {i+1}: {hv_static:.2f} eV")
+            ax_abs.set_ylabel(r"$Q_{abs}$")
+            ax_abs.set_title(rf"Absorption · $\Delta={gap_nm:.2f}\,\mathrm{{nm}}$")
+            ax_abs.grid(True, ls=":")
+            ax_abs.legend(loc="upper right")
+
+            # -- One HC panel per resonance --
+            for i_res, res in enumerate(resonances_data):
+                ax    = ax_list[i_res]
+                hv_dyn = float(res["hv_frames"][k]) if k < len(res["hv_frames"]) else 1e-6
+                if hv_dyn <= 0.0:
+                    hv_dyn = 1e-6
+
+                Te = np.asarray(res["Te_tau_frames"][k], float) / 1000.0
+                Th = np.asarray(res["Th_tau_frames"][k], float) / 1000.0
+
+                x, Te_x, Th_x = convert_raw_hot(Te, Th, E_all, dE_factor)
+                scale  = to_ps / hv_dyn
+                Te_x  *= scale
+                Th_x  *= scale
+
+                mask_e = (x >= EF) & (x <= EF + gap_nm)
+                mask_h = (x <= EF) & (x >= EF - gap_nm)
+
+                ax.fill_between((x - EF)[mask_e], Te_x[mask_e],
+                                alpha=0.4, label=r"e$^-$")
+                ax.fill_between((x - EF)[mask_h], Th_x[mask_h],
+                                alpha=0.4, label=r"h$^+$")
+
+                hv_static = hv_static_list[i_res]
+                c = colors_static[i_res % len(colors_static)]
+                ax.axvline(+hv_static, ls="--", lw=1.2, color=c, alpha=0.9)
+                ax.axvline(-hv_static, ls="--", lw=1.2, color=c, alpha=0.9)
+
+                ax.set_ylabel(
+                    rf"res {i_res+1}  "
+                    rf"$[10^{{-3}}\,\mathrm{{eV}}^{{-1}}\mathrm{{ps}}^{{-1}}\mathrm{{nm}}^{{-3}}]$"
+                )
+                ax.set_ylim(bottom=0.0)
+                ax.grid(True, ls=":")
+                ax.legend(loc="upper right", fontsize=8)
+
+            ax_list[-1].set_xlabel(r"$E - E_F$ (eV)")
+            ax_list[-1].set_xlim(-gap_nm, +gap_nm)
+
+            fig.suptitle(
+                rf"{title_prefix}"
+                rf"\n$\Delta={gap_nm:.2f}\,\mathrm{{nm}},\ \tau={tau_fs/1000:.2f}\,\mathrm{{ps}}$"
+            )
+            fig.tight_layout(rect=[0, 0, 1, 0.92])
+            fig.canvas.draw()
+            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            writer.append_data(frame)
+            plt.close(fig)
+
+
+def launch_builder(display_mode='inline'):
+    """
+    Launch the interactive nanocluster builder.
+
+    Parameters
+    ----------
+    display_mode : str, optional
+        Display mode: 'inline' (default), 'browser', or 'auto'
+
+    Returns
+    -------
+    NanoclusterBuilder
+        The builder instance for exporting configurations
+    """
+    print("🚀 Launching Interactive Nanocluster Builder...")
+    if display_mode == 'inline':
+        print("💡 3D plots will display inline in the notebook")
+    elif display_mode == 'browser':
+        print("💡 3D plots will open in your browser")
+    else:
+        print("💡 3D plots will try browser, fallback to inline")
+    print()
+    return NanoclusterBuilder(display_mode=display_mode)

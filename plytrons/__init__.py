@@ -4,9 +4,9 @@ Plytrons - Tools for computing hot carrier distributions in metallic nanoparticl
 
 # Import interactive builder for easy access
 try:
-    from .interactive_builder import launch_builder, NanoclusterBuilder, MATERIALS
+    from .plot_utils import launch_builder, NanoclusterBuilder, MATERIALS, MEDIA
 except ImportError:
-    # Plotly not installed
+    # Plotly / ipywidgets not installed
     pass
 
 __version__ = "0.1.0"

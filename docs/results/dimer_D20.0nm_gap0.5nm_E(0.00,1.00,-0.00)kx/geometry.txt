@@ -1,5 +1,0 @@
-N particles: 2
-sphere1: label=Sphere1_Silver, D=20.000 nm, pos=(0.000, 10.250, 0.000) nm, lmax=10
-sphere2: label=Sphere2_Silver, D=20.000 nm, pos=(0.000, -10.250, 0.000) nm, lmax=10
-eps_h=1.0
-E0=1 V/nm, e_hat=[ 0.0000000e+00  1.0000000e+00 -1.2246468e-16], k_hat=[1. 0. 0.]

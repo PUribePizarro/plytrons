@@ -1,0 +1,461 @@
+================================================================================
+  PLYTRONS — CODE ARCHITECTURE & WORKFLOW GUIDE
+================================================================================
+
+This file describes every module in plytrons/, what it does, how the pieces
+depend on each other, and how results are organised on disk.
+
+Read this before diving into any individual file.
+
+--------------------------------------------------------------------------------
+  BIG PICTURE: DEPENDENCY GRAPH
+--------------------------------------------------------------------------------
+
+                    math_utils.py          (Math Core)
+                         |
+           +-------------+-------------+
+           |                           |
+      bcm_sphere.py           quantum_well.py     (Physics Cores)
+      drude_model.py
+           |                           |
+           +-------------+-------------+
+                         |
+                  hot_carriers.py        (Primary Core)
+                         |
+                  relaxation.py          (Secondary Core)
+                         |
+           +-------------+-------------+
+           |             |             |
+   HC_dynamics.py  HC_spatial.py  HC_statics.py   (Advanced Layers)
+           |             |             |
+           +-------------+-------------+ 
+                         |    
+                    plot_utils.py        (Support Layer)
+
+
+Read direction: lower modules import from those above them.
+Advanced layers import from both cores; cores do not import from layers.
+
+--------------------------------------------------------------------------------
+  RESULTS FOLDER ARCHITECTURE
+--------------------------------------------------------------------------------
+
+  Results are written by HC_statics.py via make_results_folder().
+  Each simulation run creates one subdirectory whose name encodes the geometry
+  and polarisation so that results are self-documenting.
+
+  Root layout (auto-created by make_results_folder):
+
+    results/
+    └── {geometry}_{diameter}_{gap}_{polarisation}/
+        ├── geometry.txt
+        ├── geometry.png
+        ├── absorption_spectrum_sphere{i}.png          (one per sphere)
+        ├── hot_carriers_static_Np{i}_Res{r}_tau{t}.png
+        ├── hot_carriers_dynamics_Np{i}_Res{r}.gif
+        └── Ne_cdf_Np{i}_Res{r}_{pol}.png
+
+  Folder name examples:
+    monomer_D5.0nm_Ezkx/
+    dimer_D5.0nm_gap1.0nm_Exkz/
+    trimer_D5.0nm_gap1.5nm_Eykz/
+    5-mer-planar_D5.0nm_gap2.0nm_Ezkx/
+    7-mer-ring_D5.0nm_gap0.5nm_Exky/
+
+  Optional suffixes controlled by make_results_folder arguments:
+    _lmax10           if lmax is passed explicitly
+    _epsh2.25         if eps_h != 1
+    _YYYYmmdd-HHMMSS  if include_timestamp=True
+
+  File descriptions:
+    geometry.txt         Plain-text summary: N particles, positions, diameters,
+                         lmax, eps_h, E0, polarisation vectors.
+
+    geometry.png         3D rendered sphere cluster with k, E, H field arrows.
+
+    absorption_spectrum_sphere{i}.png
+                         Absorption efficiency Q_abs vs photon energy (eV)
+                         for sphere i in the cluster.
+
+    hot_carriers_static_Np{i}_Res{r}_tau{t}.png
+                         Snapshot of the hot-carrier distribution at lifetime
+                         tau=t fs for resonance r of nanoparticle i.
+                         Shows Te[tau_idx] and Th[tau_idx] as energy histograms
+                         overlaid on the quantum-well level diagram.
+
+    hot_carriers_dynamics_Np{i}_Res{r}.gif
+                         Animated sweep over all tau values in tau_e.
+                         Each frame is the static snapshot at one lifetime.
+
+    Ne_cdf_Np{i}_Res{r}_{pol}.png
+                         Cumulative hot-electron yield per photon:
+                         N_e(epsilon) = fraction of hot electrons above epsilon eV
+                         above the Fermi level. Multiple curves for each tau.
+
+  Pre-organised archive layout (for long-term storage):
+
+    Results/
+    └── spherical_NP/
+        ├── Monomer/
+        │   ├── dynamic_simulations/
+        │   └── static_simulations/
+        ├── Dimer/
+        │   ├── dynamic_simulations/
+        │   └── static_simulations/
+        ├── Trimer/ ...
+        ├── Tetramer/ ...
+        ├── Pentamer/ ...
+        ├── Hexamer/ ...
+        ├── Heptamer/ ...
+        ├── Octahedron/ ...
+        ├── Satellite/ ...
+        └── N-mer/
+            ├── dynamic_simulations/
+            └── static_simulations/
+
+--------------------------------------------------------------------------------
+  MATH CORE
+--------------------------------------------------------------------------------
+
+  math_utils.py
+  -------------
+  Foundation of the whole project. Contains:
+
+  - Physical constants in project units (eV, nm, fs):
+      hbar = 0.6582118 eV*fs
+      me   = 5.686     eV*fs^2/nm^2
+      eps0 = 0.055263  e/(V*nm)
+
+  - Angular coupling coefficients (Numba JIT-compiled):
+      Wigner3j(j1,j2,j3,m1,m2,m3)
+      clebsch_gordan(j1,j2,j,m1,m2,m)
+      gaunt_coeff(l1,l2,l3,m1,m2,m3)    G(l1,m1;l2,m2|l3,m3)
+      em_sph_harm(l, m, theta, phi)      EM-convention spherical harmonics
+
+  - Why this exists separately: all JIT-compiled angular functions must be
+    defined before any downstream module imports them, and several physics
+    cores share them (bcm_sphere, hot_carriers, relaxation, HC_spatial all
+    import gaunt_coeff or Wigner3j from here).
+
+--------------------------------------------------------------------------------
+  PHYSICS CORES
+--------------------------------------------------------------------------------
+
+  bcm_sphere.py
+  -------------
+  Boundary-Charge Method (BCM) solver for spherical nanoparticles.
+  Given a set of spheres with positions, diameters, and a dielectric function,
+  it solves the electromagnetic scattering problem semi-analytically using a
+  multipole expansion up to order lmax.
+
+  Key output objects:
+    EField       — dataclass describing the incident plane wave (E0, k_hat, e_hat)
+    BCMObject    — dataclass for one sphere (label, diameter, lmax, eps, position)
+                   also stores the solved EM coefficients X_lm after the run
+
+  Key functions:
+    Ginternal(obj)             self-interaction matrix for one sphere
+    Gexternal(obj_i, obj_j)   inter-sphere coupling matrix
+    Efield_coupling(obj, ef)  incident field projection onto multipoles
+    solve_BCM(w, eps_h, ...)  solve the full linear system at one frequency
+    EM_power(w, eps_h, ...)   absorption and scattering cross-sections
+
+  After a frequency sweep the coefficients X_lm at any wavelength are retrieved
+  with:  X_lm = obj.coef_at(lam_um)
+
+  drude_model.py
+  --------------
+  Dielectric functions for metallic nanoparticles.
+
+  - eps_drude_bulk(omega_eV, ...)
+      Standard Drude model:  eps(omega) = eps_b - wp^2 / [omega(omega + i*gamma)]
+
+  - eps_drude_nano_nordlander(omega_eV, D_nm, ...)
+      Size-corrected Drude for small particles, adding the Landau damping term:
+        gamma_eff = gamma_bulk + hbar*vF / R
+
+  - Also computes Garcia de Abajo PWA dipole transition matrix elements S_ij.
+
+  quantum_well.py
+  ---------------
+  Spherical quantum well (infinite-well approximation) for the conduction band
+  electrons inside a metallic nanoparticle.
+
+  - ke(E)                wavevector inside the sphere  k = sqrt(2*me*E)/hbar
+  - get_bound_states(a)  find all (n,l) eigenvalues by bisection
+  - get_normalization(a, E_matrix)   normalization coefficients A_nl
+  - e_state_assembly(E_matrix, A_matrix)   pack into list of QWLevelSet objects
+
+  The e_state list (one entry per l, each holding arrays Eb and A) is the
+  standard input to hot_carriers and relaxation.
+
+  electrons_per_nanoparticle(a) — quick sanity check: total electron count
+
+--------------------------------------------------------------------------------
+  PRIMARY CORE
+--------------------------------------------------------------------------------
+
+  hot_carriers.py
+  ---------------
+  Computes the photogenerated hot-carrier distribution using Fermi's golden rule.
+
+  Physics (Garcia de Abajo & Manjavacas, ACS Photonics 2014):
+    |M_fi|^2  =  (sum over EM multipoles le)
+                 pref(le)^2 * G^2(lf, le, li, -mf, mel, mi) * |X_{le,mel}|^2 * I_rad^2
+
+  where G is a Gaunt coefficient (angular selection rule) and I_rad is a radial
+  integral of the initial and final spherical Bessel wavefunctions against the
+  EM field profile inside the sphere.
+
+  Main function:
+    hot_e_dist(a_nm, hv_eV, E_F, tau_e_fs, e_state, X_lm, Pabs)
+
+    Returns (9 values):
+      Te         [len(tau), N]   smoothed electron rate distribution
+      Th         [len(tau), N]   smoothed hole rate distribution
+      Te_raw     [len(tau), N]   raw (unbroadened) electron rates per state
+      Th_raw     [len(tau), N]   raw (unbroadened) hole rates
+      Mfi2       [N, N]          transition rate matrix |M_fi|^2 (energy-sorted)
+      E_sorted   [N]             state energies, energy-sorted (eV)
+      S          float           normalization: total computed power (eV/fs)
+      Pabs       float           input absorbed power (eV/fs)  [echo of input]
+      P_diss     float           = Pabs / S  (power normalization factor)
+
+  NOTE on Te_raw ordering: Te_raw is in l-order (l=0 block, then l=1 block,
+  etc.) which matches the internal state map — NOT energy-sorted. Use E_sorted
+  only with Mfi2 and the smoothed Te/Th arrays.
+
+  Also exported:
+    hot_e_cdf_per_photon(Te_raw, e_state, hv, Pabs, E_F, eps_eval)
+        Cumulative distribution of hot electrons above an energy threshold
+        (hot-electron yield per absorbed photon).
+
+    count_eh_generated(Te, Th, e_state, E_F)
+        Total number of hot electrons and holes above E_F.
+
+--------------------------------------------------------------------------------
+  SECONDARY CORE
+--------------------------------------------------------------------------------
+
+  relaxation.py
+  -------------
+  All scattering physics from Saavedra, Asenjo-Garcia & Garcia de Abajo,
+  ACS Photonics 3, 1637 (2016).
+
+  Part A — Electron-electron scattering (eqs 3, 9, 10, 14)
+    ee_scattering_rates(a_nm, e_state, T_K, wp_eV, eps_b, gamma_eV)
+        Full [N x N] rate matrix gamma_{j<-i}^{e-e} [1/fs] using the
+        screened Coulomb Green's function G_l(omega) and Bose-Einstein factor.
+
+    ee_lifetimes(a_nm, E_F, e_state, T_K, wp_eV, eps_b, gamma_eV)
+        Diagonal sum -> lifetime tau_ee[i] = 1 / sum_j gamma_{j<-i} [fs]
+
+  Part B — Electron-phonon scattering
+    EPH_COUPLING   dict with G (e-ph coupling constant) for 'Silver' and 'Gold'
+                   [eV / (fs nm^3 K)]
+
+    electronic_specific_heat(a_nm, E_F, e_state, T_K)
+        c_e(T) using the canonical-ensemble energy variance formula (exact for
+        any quantum level structure, not just the linear Sommerfeld limit).
+
+    eph_rate(a_nm, E_F, e_state, T_K)
+        Scalar rate gamma^{e-ph} = G_coupling / c_e(T) [1/fs]
+
+    eph_lifetime(a_nm, E_F, e_state, T_K)
+        Scalar tau_{e-ph} = 1 / gamma^{e-ph} [fs]
+
+    eph_rate_vs_temperature(a_nm, E_F, e_state, T_array)
+        Vectorised over a temperature array; returns (gamma_arr, ce_arr).
+
+  Part C — Effective lifetime and state-resolved distribution
+    effective_lifetime(a_nm, E_F, e_state, T_K, wp_eV, eps_b, gamma_eV)
+        Returns (tau_eff, E_all, l_all, tau_eph_scalar) where
+          1/tau_eff[i] = 1/tau_ee[i] + 1/tau_eph
+        Results in l-order (same as e_state flattening).
+
+    hot_e_dist_resolved(a_nm, hv_eV, E_F, tau_eff_sorted, e_state, X_lm, Pabs)
+        State-resolved hot-carrier spectrum with per-state Lorentzian broadening.
+        Each state i gets width: FWHM[i] = hbar / tau_eff[i]
+        Returns (Te, Th, Te_raw, Th_raw, Mfi2, E_vals, S, Pabs, P_diss).
+
+--------------------------------------------------------------------------------
+  ADVANCED LAYERS
+--------------------------------------------------------------------------------
+
+  HC_dynamics.py
+  --------------
+  Simulation automation + animated visualization for multi-resonance sweeps.
+  Imports from both cores and re-exports their public API for backward
+  compatibility (so old scripts importing from HC_dynamics still work).
+
+  Own functions:
+    cluster_peak_energies(w, Pabs_list, tol_eV)
+        Track resonance peaks across a parameter sweep and group them by
+        energy proximity (within tol_eV). Returns clustered peak indices.
+
+    combined_absorption_hotcarriers_gif(...)
+        2-panel animated GIF: left = absorption spectrum at current params,
+        right = hot-carrier energy distribution. Loops over a parameter sweep.
+
+    static_multi_resonance_grid_gif(...)
+        Animated GIF showing a grid of static HC snapshots, one panel per
+        resonance peak, stepping through a parameter sweep.
+
+  Typical use case: sweep gap distance, wire diameter, or number of particles,
+  and produce a GIF that shows how the absorption resonances and the hot-carrier
+  distribution evolve.
+
+  HC_spatial.py
+  -------------
+  Spatial distribution of photogenerated hot carriers inside a nanoparticle.
+  Advanced layer on top of hot_carriers.py.
+
+  Key insight: hot_carriers.py computes Te_raw[f] — the rate at which state f
+  is excited. The spatial profile is recovered by weighting those rates with the
+  radial wavefunction density of state f:
+
+    n_e(r) = sum_f  Te_raw[f] * |A_f|^2 * |j_{lf}(k_f r)|^2 * r^2   [1/(nm fs)]
+
+  Two levels of detail:
+
+  hot_e_dist_spatial(a_nm, hv_eV, E_F, tau_fs, e_state, X_lm, Pabs, Nr)
+      Angle-averaged radial profile n_e(r) and volumetric density rho_e(r).
+      Fast: Numba kernel over the radial grid.
+      Returns: r, n_e_r, n_h_r, rho_e_r, rho_h_r, E_all, Te_raw, Th_raw
+
+  hot_e_density_2d(a_nm, hv_eV, E_F, tau_fs, e_state, X_lm, Pabs, Nr, Ntheta)
+      Full 2D polar map rho_e(r, theta) resolved in m quantum numbers.
+      Captures polarisation-induced angular anisotropy:
+        - x/y-pol (e_hat perp z): excites |m|=1 states -> equatorial hot carriers
+        -   z-pol (e_hat || z):   excites  m=0 states  -> polar hot carriers
+      Uses Gaunt coefficients for the m-resolved matrix elements and
+      |Y_{lf,mf}(theta)|^2 for the angular weight.
+      Returns: r, theta, rho_e [Nr x Ntheta], rho_h [Nr x Ntheta]
+
+  Visualisation:
+    plot_radial_profile(r, n_e_r, n_h_r, rho_e_r, rho_h_r, ...)
+        1x2 figure: left = n_e(r) integrated density, right = rho_e(r) volumetric
+    plot_2d_density(r, theta, rho_e, rho_h, ...)
+        pcolormesh in Cartesian (x,z) coordinates, mirrored for full circle,
+        LogNorm colormap, sphere boundary drawn as white dashed circle
+
+  HC_statics.py
+  -------------
+  Full-batch simulation script for clusters of spherical nanoparticles.
+  This is the highest-level entry point — run it as a script, not imported.
+
+  Workflow:
+    1. Define sweep parameters (gap distances, polarisations, cluster sizes)
+    2. Build BCMObject list for each geometry
+    3. Frequency-sweep BCM to get absorption spectra and X_lm coefficients
+    4. For each sphere and each absorption peak:
+         - Call hot_e_dist -> Te, Th, Te_raw, Mfi2
+         - Call hot_e_cdf_per_photon -> Ne vs energy threshold CDF
+         - Generate animated GIF of HC dynamics  (if plot_flag='dynamics'|'both')
+         - Generate static HC snapshot at chosen tau (if plot_flag='static'|'both')
+    5. Save all figures and geometry metadata to a results folder
+
+  Input parameters to edit at the top of the file:
+    STRUCTURE      cluster geometry (2=dimer, 3=trimer, 4=tetrahedron, 5=pentamer, 7=heptamer)
+    D              sphere diameter [nm]
+    SIM_GAPS       list of gap distances [nm]
+    SWEEP_MODE     None | 'fixed_gap' | 'fixed_centers'
+    lmax           spherical harmonic cutoff
+    tau            single lifetime for the static snapshot [fs]
+    EF             Fermi level [eV]
+    plot_flag      'static' | 'dynamics' | 'both'
+
+--------------------------------------------------------------------------------
+  SUPPORT LAYER
+--------------------------------------------------------------------------------
+
+  plot_utils.py
+  -------------
+  Shared plotting helpers used by all advanced layers.
+
+  make_results_folder(bcms, efield, *, lmax, eps_h, prefix, ...)
+      Auto-generates a descriptive output directory name from the geometry:
+        monomer_D5.0nm_Ezkx/
+        dimer_D5.0nm_gap1.0nm_Exkz/
+        trimer_D5.0nm_gap1.5nm_Eykx/
+        5-mer-planar_D5.0nm_gap2.0nm_Ezkx/
+      Creates the directory and returns its Path.
+
+  plot_spheres(pos, radii, ...)
+      3D sphere cluster visualisation with EM field arrows (k, E, H vectors).
+
+  plot_transition_matrix_colormap(Mfi2, E_vals, ...)
+      Heatmap of the |M_fi|^2 transition matrix in energy space.
+      Supports 'asinh' and 'log' scale, quantile clipping.
+
+  plot_Ne_cdf_steps(eps_axis, Ne, tau_e, ...)
+      Step plot of hot-electron yield per photon vs energy threshold,
+      for every lifetime in tau_e. Saves to outdir.
+
+  hot_carrier_dynamics_plot(Te, Th, Te_raw, Th_raw, e_state, ...)
+      Animated GIF of the hot-carrier energy distribution evolving over tau_e.
+
+  hot_carriers_plot(Te, Th, Te_raw, Th_raw, e_state, ...)
+      Static version of the above at a single tau.
+
+  build_cluster(structure, D, gap, lmax, eps_func, eps_h)
+      Build a list of BCMObject for standard cluster geometries
+      (monomer, dimer, trimer, tetrahedron, pentamer, heptamer).
+
+  get_polarizations(structure)
+      Return the canonical list of (k_hat, e_hat) polarisation pairs
+      for a given cluster geometry.
+
+  path_with_polarization(out_path, efield)
+      Appends a polarisation tag to a file or folder path
+      (e.g., hot_carriers_static.png -> hot_carriers_static_Ey.png).
+
+--------------------------------------------------------------------------------
+  DOCS FOLDER
+--------------------------------------------------------------------------------
+
+  docs/ contains one Jupyter notebook per physics module:
+
+  bcm_sphere_example.ipynb           BCM solver: single sphere and coupled clusters
+  drude_model_example.ipynb          Bulk vs size-corrected dielectric functions
+  quantum_well_example.ipynb         Bound states and wavefunctions for a sphere
+  hot_carriers_distribution.ipynb    Hot-carrier energy distributions, Mfi2 maps
+  Transition_Matrix_Analysis.ipynb   Detailed analysis of the |M_fi|^2 matrix
+  relaxation_example.ipynb           e-e and e-ph scattering rates, tau_eff,
+                                       state-resolved hot-carrier distribution
+  HC_spatial_example.ipynb           Spatial HC density: radial + 2D angular map
+                                       Part 1: single sphere
+                                       Part 2: homodimer (bonding vs transverse)
+  HC_dynamics_example.ipynb          Animated HC dynamics over a lifetime sweep
+  HC_statics_example.ipynb           Full-batch cluster simulation walkthrough
+
+  _build_relax_nb.py                 Builder script that generates
+                                       relaxation_example.ipynb from scratch
+                                       (run with: python _build_relax_nb.py)
+
+--------------------------------------------------------------------------------
+  QUICK REFERENCE — UNITS
+--------------------------------------------------------------------------------
+
+  All internal calculations use a consistent set of units:
+
+    Length       nm
+    Time         fs
+    Energy       eV
+    Charge       e  (elementary charge)
+    Mass         eV fs^2 / nm^2  (so that F=ma works without extra factors)
+
+  Physical constants used (from math_utils.py):
+    hbar = 0.6582118 eV*fs
+    me   = 5.686     eV*fs^2/nm^2
+    eps0 = 0.055263  e/(V*nm)
+
+  Key derived units:
+    Absorption power Pabs   [eV/fs]       (from BCM output: / (pi*eps0) * 1e-15)
+    Hot-carrier rate Te_raw [1/fs]        (per quantum state, l-ordered)
+    Radial HC density n_e   [1/(nm fs)]   (angle-averaged)
+    Volumetric density rho  [1/(nm^3 fs)] (full 3D)
+
+================================================================================
+  END OF READ_FIRST.txt
+================================================================================

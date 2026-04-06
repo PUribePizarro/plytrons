@@ -6,8 +6,7 @@ from numba import prange
 from numba.typed import List as _NList   # ← NEW
 
 # ── Project-specific helpers ───────────────────────────────────────────────
-from plytrons.math_utils import eps0, hbar, nb_meshgrid, me
-from plytrons.wigner3j import gaunt_coeff
+from plytrons.math_utils import eps0, hbar, nb_meshgrid, me, gaunt_coeff
 from plytrons.quantum_well import js_real, ke, QWLevelSet, electrons_per_nanoparticle
 
 # =============================================================================
